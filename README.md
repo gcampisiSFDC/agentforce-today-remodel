@@ -27,20 +27,35 @@ A modern React + Express application that delivers AI-powered sales briefings us
 │   React App     │ ───▶ │  Express API    │ ───▶ │   Salesforce    │
 │   (Vite)        │      │  (Node.js)      │      │   MCP Gateway   │
 └─────────────────┘      └────────┬────────┘      └─────────────────┘
-                                  │
-                                  ▼
+                                  │                        │
+                                  │                   ECA / JWT
+                                  ▼                   (internal)
                          ┌─────────────────┐
                          │  Anthropic /    │
                          │  Models API     │
                          └─────────────────┘
 ```
 
+### Authentication Flow
+
+This app uses **two different authentication mechanisms**:
+
+| Component | Auth Type | Purpose |
+|-----------|-----------|---------|
+| **User Login** | Connected App (OAuth 2.0 PKCE) | Browser-based user authentication |
+| **MCP Gateway** | External Client App (ECA) | Data access via hosted MCP — handled internally by Salesforce |
+| **Models API** | External Client App (ECA) | LLM access with Trust Layer |
+
+**You only configure the Connected App** — the MCP gateway's ECA authentication is managed by Salesforce's hosted infrastructure. When your user logs in via OAuth, their access token is passed to the MCP gateway, which uses its own ECA credentials internally.
+
+> **Note on Observability:** Because MCP uses ECA internally, real-time event monitoring (ApiEvent) has limited visibility into MCP queries. See the [Event Monitoring documentation](https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/sforce_api_objects_apievent.htm) for details.
+
 ## Prerequisites
 
 - **Node.js** 18+ 
-- **Salesforce Org** with API access
-- **Connected App** configured for OAuth 2.0 PKCE
-- **Anthropic API Key** (for AI features) — or Salesforce Models API access
+- **Salesforce Org** with API access and Shield Event Monitoring (for full observability)
+- **Connected App** configured for OAuth 2.0 PKCE (for user login only)
+- **Anthropic API Key** (for AI features) — or Salesforce Models API access via ECA
 
 ## Quick Start
 
@@ -52,9 +67,9 @@ cd agentforce-today-remodel
 npm install
 ```
 
-### 2. Configure Salesforce Connected App
+### 2. Configure Salesforce Connected App (User Login)
 
-Create a Connected App in your Salesforce org:
+Create a Connected App for **user authentication** (the MCP gateway uses its own ECA internally):
 
 1. **Setup** → **App Manager** → **New Connected App**
 2. Enable OAuth Settings:
@@ -65,6 +80,8 @@ Create a Connected App in your Salesforce org:
      - `openid`
 3. Enable **PKCE** (Require Proof Key for Code Exchange)
 4. Save and copy the **Consumer Key** (Client ID)
+
+> **Why Connected App and not ECA?** Connected Apps provide full Shield Event Monitoring visibility (LoginEvent, ApiEvent). ECA/JWT authentication — which the MCP gateway uses internally — has observability gaps in real-time event monitoring. For user-facing login, Connected Apps are preferred.
 
 ### 3. Configure Environment
 
