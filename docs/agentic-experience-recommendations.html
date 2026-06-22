@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Building Agentic Experiences — Best Practices Talk Track</title>
+  <style>
+    :root {
+      --bg: #fafafa;
+      --text: #1a1a1a;
+      --muted: #555;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.8;
+      color: var(--text);
+      background: var(--bg);
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 3rem 1.5rem 4rem;
+      font-size: 1.05rem;
+    }
+    
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+    }
+    
+    .subtitle {
+      color: var(--muted);
+      margin-bottom: 2.5rem;
+      font-size: 0.95rem;
+    }
+    
+    p { margin-bottom: 1.25rem; }
+    
+    .divider {
+      text-align: center;
+      color: #ccc;
+      margin: 2rem 0;
+      font-size: 1.2rem;
+      letter-spacing: 0.5em;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Building Agentic Experiences on Salesforce</h1>
+<p class="subtitle">Talk track — best practices conversation</p>
+
+<p>Before we even get to agents, it's worth stepping back and talking about how Salesforce thinks about API security in general. Because the same principles apply—agents just make them more visible.</p>
+
+<p>Salesforce has always had a layered security model. At the bottom, you have object-level and field-level security—what data can this user even see? Then you have sharing rules and record-level access—of the data they can see, which specific records? On top of that, you have session controls, IP restrictions, login policies. And then at the API layer, you have Connected Apps, OAuth scopes, and API limits. Each layer is a gate. If any gate says no, the request stops there.</p>
+
+<p>The design philosophy is that the platform enforces security, not the caller. An external app doesn't get to decide what it can access—Salesforce decides based on the user context, the Connected App configuration, and the security model. That's different from a lot of systems where the API trusts whatever credentials it receives and the caller is responsible for not overreaching. Salesforce assumes the caller will overreach and gates it anyway.</p>
+
+<p>This matters for agents because an agent is just another API caller. It doesn't get special treatment. It inherits the permissions of whoever's running it, and every operation goes through the same gates. The agent can't see data the user can't see. It can't bypass sharing rules. It can't skip field-level security. That's the baseline—and it's actually a strength, because it means you don't have to reinvent security for AI. You just have to make sure your existing security model is tight.</p>
+
+<p class="divider">• • •</p>
+
+<p>In terms of best practices for agentic experiences specifically, I'd start with a few things.</p>
+
+<p>One of the biggest mistakes customers can make is letting the middleware layer become its own security model. Just because you have an MCP server sitting between your AI model and Salesforce doesn't mean it should bypass Salesforce controls. You still want Salesforce enforcing object and field-level security, sharing rules, data classifications, audit logging, encryption policies, session and API governance—all of it. That consistency becomes really important as environments scale. If you start building a parallel security model in your middleware, you're going to end up with drift, gaps, and a compliance headache down the road.</p>
+
+<p class="divider">• • •</p>
+
+<p>So with that in mind, take a close look at your object-level and field-level security. This is foundational. When you're building an agentic experience—whether it's something custom or using Agentforce—the agent is going to inherit the permissions of whatever user is running it. So if you've got a shared integration user with broad access, that's the ceiling for what the agent can see. You want to make sure the agent can only access the data it actually needs to do its job. An agent that's answering questions about order status doesn't need to see salary information, right? So audit that upfront.</p>
+
+<p class="divider">• • •</p>
+
+<p>Second, if you're on Salesforce already, I'd seriously consider Agentforce. And I'm not saying that as a sales pitch—I'm saying it because all of the governance and security stuff is baked in. You get the Einstein Trust Layer, which handles things like toxicity detection and PII masking. You get session tracing, so there's a full audit trail of what the agent did. You get grounding that respects your security model automatically. If you build custom, you're going to have to build or buy all of that yourself. It's doable, but it's a lot of work.</p>
+
+<p class="divider">• • •</p>
+
+<p>Now, if you do decide to build on your own surface—maybe you need a specific UI or you're integrating into an existing app—there are some things you should do.</p>
+
+<p>Use Named Credentials. Don't put secrets in environment variables or config files. Named Credentials give you secure storage, automatic token refresh, and an audit trail. Even if your app runs outside of Salesforce, consider whether Salesforce should be the source of truth for that credential.</p>
+
+<p>Use Connected Apps and keep your OAuth scopes tight. Every scope you request is attack surface. If your agent only needs to run queries via MCP, don't request full API access. Principle of least privilege applies here just like anywhere else.</p>
+
+<p>For server-to-server flows—things like background jobs or scheduled processes where there's no human in the loop—use JWT Bearer authentication. It's certificate-based, so you're not passing secrets around. And here's the key thing: it avoids long-lived tokens. With JWT Bearer, you generate a short-lived assertion—usually just a few minutes—sign it with your private key, and exchange it for an access token that's also short-lived. When that expires, you just generate a new assertion and get a new token. There's no refresh token sitting in a database somewhere that could be compromised. If something does get exposed, the window is small. And if you need to revoke access entirely, you remove the certificate from the Connected App and it's done.</p>
+
+<p class="divider">• • •</p>
+
+<p>On the observability side, here's something that's good to know: if you're making calls to Salesforce's MCP server, those are already being logged. They show up in the EventLogFile under RestApi events. You can query those and see the endpoint, the user, the connected app, the timestamp—everything you'd need for an audit trail. So you don't have to build custom logging for data access. It's already there.</p>
+
+<p>But here's the catch. If you're calling an LLM directly—like hitting Anthropic or OpenAI from your app—those calls don't touch Salesforce at all. Which means no Trust Layer, no audit trail in Salesforce, no toxicity filtering, nothing. If you need that stuff, you have to route your LLM calls through Salesforce's Models API instead of calling the provider directly. That way the calls go through the Einstein Trust Layer and everything gets logged. There's a bit of extra latency—maybe 100 to 200 milliseconds—but for regulated industries, that's usually worth it.</p>
+
+<p class="divider">• • •</p>
+
+<p>So to sum it up: lock down your data access model first, consider Agentforce if the built-in governance fits your needs, and if you're building custom, use Named Credentials, keep your scopes minimal, use JWT for server-to-server, and route through the Models API if you need Trust Layer coverage. The building blocks are all there—you just have to put them together intentionally.</p>
+
+</body>
+</html>

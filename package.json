@@ -1,0 +1,26 @@
+{
+  "name": "agentforce-today-remodel",
+  "version": "1.0.0",
+  "description": "Agentforce Today Remodel — AI sales briefing dashboard powered by Salesforce MCP + Anthropic",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n server,vite -c blue,green \"node --watch server.js\" \"vite\"",
+    "build": "vite build",
+    "start": "node server.js",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.26.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "recharts": "^3.8.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.0",
+    "concurrently": "^8.2.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^5.4.0"
+  }
+}
