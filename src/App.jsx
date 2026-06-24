@@ -29,6 +29,9 @@ export default function App() {
   const [chatOpen,       setChatOpen]       = useState(false);
   const [llmProvider, setLlmProvider] = useState('external');
   const [trustLayer, setTrustLayer]   = useState(false);
+  const [connections, setConnections] = useState([]);
+  const [activeConnection, setActiveConnection] = useState(null);
+  const [connOpen, setConnOpen]       = useState(false);
 
   // Check auth status on mount and after OAuth redirect
   useEffect(() => {
@@ -39,6 +42,7 @@ export default function App() {
       window.history.replaceState({}, '', '/');
     }
     checkAuth();
+    loadConnections();
   }, []);
 
   async function checkAuth() {
@@ -46,9 +50,43 @@ export default function App() {
       const res = await fetch('/api/auth/status');
       const d   = await res.json();
       setAuth({ ...d, checked: true });
+      if (d.activeConnection) setActiveConnection(d.activeConnection);
       if (d.authenticated) loadToday(model);
     } catch {
       setAuth(a => ({ ...a, checked: true }));
+    }
+  }
+
+  async function loadConnections() {
+    try {
+      const res = await fetch('/api/connections');
+      const d   = await res.json();
+      setConnections(d.connections ?? []);
+      setActiveConnection(d.active);
+    } catch { /* connection list is best-effort */ }
+  }
+
+  async function handleConnectionChange(c) {
+    setConnOpen(false);
+    if (!c.available || c.id === activeConnection) return;
+    try {
+      const res = await fetch('/api/connections/use', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: c.id }),
+      });
+      const result = await res.json();
+      if (result.ok) {
+        setActiveConnection(result.active);
+        setConnections(result.connections ?? connections);
+        loadToday(model, true);  // re-fetch from the new source
+      } else if (result.needsAuth) {
+        window.location.href = result.loginUrl;  // OAuth connect for this connection
+      } else {
+        setError(result.error || 'Could not switch connection');
+      }
+    } catch (err) {
+      setError(`Failed to switch connection: ${err.message}`);
     }
   }
 
@@ -67,6 +105,7 @@ export default function App() {
         setLlmProvider(result.llmProvider);
         setTrustLayer(result.trustLayer ?? false);
       }
+      if (result.activeConnection) setActiveConnection(result.activeConnection);
       if (result._meta) {
         console.log(`[Dashboard] Loaded in ${result._meta.responseTimeMs}ms${result._meta.cached ? ' (cached)' : ''}`);
       }
@@ -117,7 +156,7 @@ export default function App() {
   }
 
   return (
-    <div className="app" onClick={() => modelOpen && setModelOpen(false)}>
+    <div className="app" onClick={() => { if (modelOpen) setModelOpen(false); if (connOpen) setConnOpen(false); }}>
       <ForecastChat
         open={chatOpen}
         onClose={() => setChatOpen(false)}
@@ -136,6 +175,11 @@ export default function App() {
         llmProvider={llmProvider}
         trustLayer={trustLayer}
         onProviderToggle={handleProviderToggle}
+        connections={connections}
+        activeConnection={activeConnection}
+        connOpen={connOpen}
+        onConnToggle={(e) => { e.stopPropagation(); setConnOpen(o => !o); }}
+        onConnChange={handleConnectionChange}
       />
       <div className="layout">
         <DashboardPanel

@@ -9,6 +9,9 @@ node_modules/
 # Build output
 dist/
 
+# Salesforce CLI local cache
+.sfdx/
+
 # Backups
 *.backup
 

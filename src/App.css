@@ -233,6 +233,54 @@ a { color: inherit; text-decoration: none; }
   border-radius: 4px; padding: 1px 5px; text-transform: uppercase;
 }
 
+/* Connection trigger + dropdown (mirrors the model selector) */
+.conn-trigger-wrap { position: relative; }
+
+.conn-trigger {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border: 1px solid var(--border-md);
+  border-radius: var(--radius-sm); font-size: 12px; font-weight: 600;
+  color: var(--text-2); background: var(--bg);
+  transition: border-color .15s, background .15s; white-space: nowrap;
+}
+.conn-trigger:hover { border-color: #c9c2b8; background: #f5f2ed; }
+.conn-trigger-label { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+
+.conn-dropdown {
+  position: absolute; top: calc(100% + 8px); right: 0;
+  min-width: 248px;
+  background: var(--bg-white);
+  border: 1px solid var(--border-md);
+  border-radius: var(--radius-md);
+  padding: 6px 0; z-index: 200;
+  box-shadow: 0 8px 24px rgba(139, 115, 85, 0.12), 0 2px 6px rgba(139, 115, 85, 0.08);
+  animation: fadeIn .12s ease;
+}
+.conn-dropdown-label {
+  font-size: 10px; font-weight: 800; letter-spacing: .12em;
+  color: var(--text-3); padding: 5px 12px 8px; text-transform: uppercase;
+}
+.conn-option {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; text-align: left; padding: 7px 12px;
+  transition: background .1s;
+}
+.conn-option:hover:not(:disabled) { background: #faf8f5; }
+.conn-option--selected { background: #fdf5f0; }
+.conn-option--disabled { opacity: .45; cursor: not-allowed; }
+.conn-option-icon { display: flex; align-items: center; width: 18px; flex-shrink: 0; color: var(--text-2); }
+.conn-option-info { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.conn-option-name { font-size: 12.5px; font-weight: 600; color: var(--text-1); }
+.conn-option-sublabel { font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
+.conn-option-state { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.conn-option-check { color: var(--accent); }
+.conn-option-tag {
+  font-size: 9px; font-weight: 700; letter-spacing: .06em;
+  color: var(--text-3); border: 1px solid var(--border-md);
+  border-radius: 4px; padding: 1px 5px; text-transform: uppercase;
+}
+.conn-option-tag--auth { color: var(--accent); border-color: var(--accent); }
+
 /* Header buttons */
 .header-btn {
   display: inline-flex; align-items: center; gap: 6px;

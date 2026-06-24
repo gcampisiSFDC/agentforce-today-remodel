@@ -1,11 +1,15 @@
 import 'dotenv/config';
 import express from 'express';
 import { createHash, randomBytes } from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import Anthropic from '@anthropic-ai/sdk';
+
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -23,6 +27,58 @@ const CALLBACK_URL  = process.env.CALLBACK_URL  || 'http://localhost:3334/oauth/
 const PORT          = parseInt(process.env.PORT || '3334', 10);
 const APP_URL       = process.env.APP_URL || `http://localhost:${PORT}`;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+const SF_API_VERSION = process.env.SF_API_VERSION || 'v60.0';
+
+// ── Data connections ──────────────────────────────────────────────────────────
+// Three ways to reach Salesforce data, switchable live from the dashboard. Each
+// has a transport (how queries run) and an auth model (how it gets a token).
+//   - mcp  : query via the MCP `soqlQuery` tool over an HTTP transport
+//   - cli  : shell out to the `sf` CLI (the connected-app-backed local session)
+const EXTERNAL_MCP_URL = process.env.EXTERNAL_MCP_URL || '';
+const SF_CLI_ORG       = process.env.SF_CLI_ORG || '';
+
+const CONNECTIONS = {
+  'eca-external-mcp': {
+    id: 'eca-external-mcp',
+    label: 'External MCP Tools',
+    sublabel: 'ECA · third-party MCP',
+    transport: 'mcp',
+    auth: 'oauth',
+    clientId: process.env.EXTERNAL_MCP_CLIENT_ID || '',
+    scope: 'mcp_api refresh_token',
+    mcpUrl: EXTERNAL_MCP_URL,
+    // Available only once both an endpoint and a client id are configured.
+    get available() { return !!(this.clientId && this.mcpUrl); },
+  },
+  'eca-sf-mcp': {
+    id: 'eca-sf-mcp',
+    label: 'Salesforce MCP',
+    sublabel: 'ECA · SF-hosted MCP',
+    transport: 'mcp',
+    auth: 'oauth',
+    clientId: SF_CLIENT_ID || '',
+    scope: 'mcp_api refresh_token',
+    mcpUrl: MCP_URL,
+    get available() { return !!(this.clientId && this.mcpUrl); },
+  },
+  // The `sf` CLI session is itself backed by a connected app, so we surface it
+  // AS the connected-app connection — no separate legacy OAuth app needed (and
+  // the dxdo trial org blocks connected-app creation anyway).
+  'cli': {
+    id: 'cli',
+    label: 'Connected App',
+    sublabel: `sf CLI · ${SF_CLI_ORG || 'default org'}`,
+    transport: 'cli',
+    auth: 'cli',
+    cliOrg: SF_CLI_ORG,
+    // The CLI path needs no in-app OAuth; assume available and surface errors
+    // at query time if the org isn't authenticated locally.
+    get available() { return true; },
+  },
+};
+
+// Active data connection (the LLM-provider toggle is a separate concern).
+let activeConnection = process.env.DEFAULT_CONNECTION || 'cli';
 
 // LLM Gateway (takes priority over direct Anthropic)
 const GW_URL   = process.env.LLM_GATEWAY_URL   || '';
@@ -277,29 +333,99 @@ async function llmStream(systemPrompt, messages, modelId, res) {
 
 // ── OAuth token store ───────────────────────────────────────────────────────
 
-// Primary auth - for MCP (mcp_api scope)
-const auth = { accessToken: null, refreshToken: null, expiresAt: 0, codeVerifier: null, instanceUrl: null };
+// Per-connection auth state (OAuth connections only). Keyed by connection id.
+// `cli` needs no entry — its token comes from the `sf` CLI on demand.
+const connAuth = {};
+for (const id of Object.keys(CONNECTIONS)) {
+  if (CONNECTIONS[id].auth === 'oauth') {
+    connAuth[id] = { accessToken: null, refreshToken: null, expiresAt: 0, codeVerifier: null, instanceUrl: null };
+  }
+}
 
-// Secondary auth - for Models API (api scope)
+// Secondary auth - for Models API (api scope). Independent of data connection.
 const authModels = { accessToken: null, refreshToken: null, expiresAt: 0, codeVerifier: null };
 
-function isAuthenticated() { return !!(auth.accessToken || auth.refreshToken); }
+/** Is the given connection ready to serve data queries? */
+function isConnectionAuthenticated(id = activeConnection) {
+  const conn = CONNECTIONS[id];
+  if (!conn) return false;
+  if (conn.auth === 'cli') return conn.available;      // assume CLI session exists
+  const a = connAuth[id];
+  return !!(a && (a.accessToken || a.refreshToken));
+}
+
+function isAuthenticated() { return isConnectionAuthenticated(activeConnection); }
 function isModelsAuthenticated() { return !!(authModels.accessToken || authModels.refreshToken); }
 
-async function getAccessToken() {
-  if (auth.accessToken && Date.now() < auth.expiresAt) return auth.accessToken;
-  if (auth.refreshToken) return doRefresh();
+/** Resolve instance URL for the active connection (for REST calls). */
+async function getInstanceUrl(id = activeConnection) {
+  const conn = CONNECTIONS[id];
+  if (conn?.auth === 'cli') return cliOrgInfo(conn.cliOrg).then(i => i.instanceUrl);
+  return connAuth[id]?.instanceUrl || SF_LOGIN_URL;
+}
+
+/** Get a usable access token for the active data connection.
+ *  Note: CLI mode does not expose a token (recent `sf` versions hide it) — it
+ *  queries via `sf data query` instead, so this is never called for CLI. */
+async function getDataToken(id = activeConnection) {
+  const conn = CONNECTIONS[id];
+  if (!conn) { const e = new Error('UNKNOWN_CONNECTION'); e.code = 'NOT_AUTHENTICATED'; throw e; }
+
+  if (conn.auth === 'cli') {
+    const e = new Error('CLI connection does not provide a bearer token'); e.code = 'NOT_AUTHENTICATED'; throw e;
+  }
+
+  const a = connAuth[id];
+  if (a.accessToken && Date.now() < a.expiresAt) return a.accessToken;
+  if (a.refreshToken) return doConnRefresh(id);
   const err = new Error('NOT_AUTHENTICATED'); err.code = 'NOT_AUTHENTICATED'; throw err;
 }
 
-async function doRefresh() {
-  const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: auth.refreshToken, client_id: SF_CLIENT_ID });
+async function doConnRefresh(id) {
+  const conn = CONNECTIONS[id];
+  const a = connAuth[id];
+  const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: a.refreshToken, client_id: conn.clientId });
   const res = await fetch(`${SF_TOKEN_URL}/services/oauth2/token`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString() });
-  if (!res.ok) { auth.accessToken = auth.refreshToken = null; const e = new Error('Token refresh failed'); e.code = 'NOT_AUTHENTICATED'; throw e; }
+  if (!res.ok) { a.accessToken = a.refreshToken = null; const e = new Error('Token refresh failed'); e.code = 'NOT_AUTHENTICATED'; throw e; }
   const data = await res.json();
-  auth.accessToken = data.access_token;
-  auth.expiresAt   = Date.now() + Math.max((data.expires_in ?? 7200) - 120, 0) * 1000;
-  return auth.accessToken;
+  a.accessToken = data.access_token;
+  if (data.instance_url) a.instanceUrl = data.instance_url;
+  a.expiresAt   = Date.now() + Math.max((data.expires_in ?? 7200) - 120, 0) * 1000;
+  return a.accessToken;
+}
+
+// ── SF CLI bridge ─────────────────────────────────────────────────────────────
+// Short-lived cache of `sf org display` output so we don't shell out per query.
+const cliCache = { byOrg: new Map() };
+
+async function cliOrgInfo(org) {
+  const key = org || '(default)';
+  const hit = cliCache.byOrg.get(key);
+  if (hit && Date.now() < hit.expiry) return hit.promise;
+
+  // Cache the in-flight promise so concurrent callers share one `sf` invocation.
+  // We only read the instance URL here (the access token is hidden by recent
+  // CLI versions); CLI queries go through `sf data query` instead.
+  const promise = (async () => {
+    const args = ['org', 'display', '--json'];
+    if (org) args.push('--target-org', org);
+    let stdout;
+    try {
+      ({ stdout } = await execFileAsync('sf', args, { maxBuffer: 1024 * 1024 }));
+    } catch (err) {
+      const detail = (err.stderr || err.message || '').toString().slice(0, 200);
+      const e = new Error(`SF CLI not available or org not authenticated: ${detail}`);
+      e.code = 'NOT_AUTHENTICATED';
+      throw e;
+    }
+    const result = JSON.parse(stdout).result || {};
+    return { accessToken: result.accessToken ?? null, instanceUrl: result.instanceUrl };
+  })();
+
+  // Cache for 5 minutes; evict on failure so the next request retries.
+  cliCache.byOrg.set(key, { promise, expiry: Date.now() + 5 * 60 * 1000 });
+  promise.catch(() => cliCache.byOrg.delete(key));
+  return promise;
 }
 
 // Models API token management
@@ -331,33 +457,48 @@ async function doModelsRefresh() {
 function pkceVerifier()   { return randomBytes(32).toString('base64url'); }
 function pkceChallenge(v) { return createHash('sha256').update(v).digest('base64url'); }
 
-// ── OAuth routes ────────────────────────────────────────────────────────────
+// ── Data-connection OAuth routes ──────────────────────────────────────────────
+// One PKCE flow serves every OAuth connection. The connection id rides through
+// the round-trip in the `state` param so the callback knows which store to fill.
 
 app.get('/oauth/login', (req, res) => {
-  auth.codeVerifier = pkceVerifier();
+  // Connect the requested connection, or the active one by default.
+  const id = req.query.connection || activeConnection;
+  const conn = CONNECTIONS[id];
+  if (!conn || conn.auth !== 'oauth') {
+    return res.redirect(`${APP_URL}/?auth_error=${encodeURIComponent(`Connection '${id}' does not use OAuth`)}`);
+  }
+  if (!conn.clientId) {
+    return res.redirect(`${APP_URL}/?auth_error=${encodeURIComponent(`Connection '${id}' has no Client ID configured`)}`);
+  }
+  connAuth[id].codeVerifier = pkceVerifier();
   const params = new URLSearchParams({
-    response_type: 'code', client_id: SF_CLIENT_ID, redirect_uri: CALLBACK_URL,
-    code_challenge: pkceChallenge(auth.codeVerifier), code_challenge_method: 'S256',
-    scope: 'mcp_api refresh_token',
+    response_type: 'code', client_id: conn.clientId, redirect_uri: CALLBACK_URL,
+    code_challenge: pkceChallenge(connAuth[id].codeVerifier), code_challenge_method: 'S256',
+    scope: conn.scope, state: id,
   });
   res.redirect(`${SF_LOGIN_URL}/services/oauth2/authorize?${params}`);
 });
 
 app.get('/oauth/callback', async (req, res) => {
-  const { code, error } = req.query;
+  const { code, error, state } = req.query;
+  const id = state && CONNECTIONS[state] ? state : activeConnection;
+  const conn = CONNECTIONS[id];
   if (error) return res.redirect(`${APP_URL}/?auth_error=${encodeURIComponent(error)}`);
   if (!code)  return res.redirect(`${APP_URL}/?auth_error=no_code`);
   try {
-    const body = new URLSearchParams({ grant_type: 'authorization_code', code, client_id: SF_CLIENT_ID, redirect_uri: CALLBACK_URL, code_verifier: auth.codeVerifier });
+    const a = connAuth[id];
+    const body = new URLSearchParams({ grant_type: 'authorization_code', code, client_id: conn.clientId, redirect_uri: CALLBACK_URL, code_verifier: a.codeVerifier });
     const tokenRes = await fetch(`${SF_TOKEN_URL}/services/oauth2/token`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString() });
     const data = await tokenRes.json();
     if (!tokenRes.ok) throw new Error(data.error_description || data.error || 'Token exchange failed');
-    auth.accessToken  = data.access_token;
-    auth.refreshToken = data.refresh_token;
-    auth.instanceUrl  = data.instance_url;
-    auth.expiresAt    = Date.now() + Math.max((data.expires_in ?? 7200) - 120, 0) * 1000;
-    auth.codeVerifier = null;
-    console.log('  [auth] MCP token acquired ✅');
+    a.accessToken  = data.access_token;
+    a.refreshToken = data.refresh_token;
+    a.instanceUrl  = data.instance_url;
+    a.expiresAt    = Date.now() + Math.max((data.expires_in ?? 7200) - 120, 0) * 1000;
+    a.codeVerifier = null;
+    activeConnection = id;  // newly-authenticated connection becomes active
+    console.log(`  [auth] Connection '${id}' token acquired ✅`);
     // Auto-chain: immediately acquire the Models API token (api scope) so the
     // toggle can switch instantly later without a mid-session re-auth.
     res.redirect('/oauth/models-login');
@@ -366,16 +507,53 @@ app.get('/oauth/callback', async (req, res) => {
   }
 });
 
-app.get('/api/auth/status', (req, res) => res.json({ 
-  authenticated: isAuthenticated(), 
+app.get('/api/auth/status', (req, res) => res.json({
+  authenticated: isAuthenticated(),
+  activeConnection,
   modelsAuthenticated: isModelsAuthenticated(),
-  loginUrl: '/oauth/login',
+  loginUrl: `/oauth/login?connection=${activeConnection}`,
   modelsLoginUrl: '/oauth/models-login'
 }));
-app.post('/api/auth/logout', (req, res) => { 
-  auth.accessToken = auth.refreshToken = null; auth.expiresAt = 0; 
+app.post('/api/auth/logout', (req, res) => {
+  for (const a of Object.values(connAuth)) { a.accessToken = a.refreshToken = null; a.expiresAt = 0; }
   authModels.accessToken = authModels.refreshToken = null; authModels.expiresAt = 0;
-  res.json({ ok: true }); 
+  res.json({ ok: true });
+});
+
+// ── Connection registry API ───────────────────────────────────────────────────
+
+function connectionSummary() {
+  return Object.values(CONNECTIONS).map(c => ({
+    id: c.id,
+    label: c.label,
+    sublabel: c.sublabel,
+    transport: c.transport,
+    auth: c.auth,
+    available: c.available,
+    authenticated: isConnectionAuthenticated(c.id),
+    active: c.id === activeConnection,
+  }));
+}
+
+app.get('/api/connections', (req, res) => {
+  res.json({ active: activeConnection, connections: connectionSummary() });
+});
+
+app.post('/api/connections/use', (req, res) => {
+  const { id } = req.body || {};
+  const conn = CONNECTIONS[id];
+  if (!conn) return res.status(400).json({ ok: false, error: `Unknown connection '${id}'` });
+  if (!conn.available) {
+    return res.json({ ok: false, error: `Connection '${id}' is not configured`, available: false });
+  }
+  // OAuth connections that aren't authenticated yet need the login redirect.
+  if (conn.auth === 'oauth' && !isConnectionAuthenticated(id)) {
+    return res.json({ ok: false, needsAuth: true, loginUrl: `/oauth/login?connection=${id}` });
+  }
+  activeConnection = id;
+  clearCache();  // different org/source → invalidate cached data
+  console.log(`  [connection] Switched active data connection → '${id}'`);
+  res.json({ ok: true, active: id, connections: connectionSummary() });
 });
 
 // ── Models API OAuth (separate token with 'api' scope) ───────────────────────
@@ -450,32 +628,84 @@ app.post('/api/llm/use-models-api', (req, res) => {
   res.json({ ok: true, provider: 'models-api', trustLayer: true });
 });
 
-// ── MCP helpers ─────────────────────────────────────────────────────────────
+// ── Data query dispatch ───────────────────────────────────────────────────────
+// soql() runs against whichever connection is active, using its transport.
 
 async function withMcpClient(fn) {
-  const token = await getAccessToken();
-  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), { requestInit: { headers: { Authorization: `Bearer ${token}` } } });
+  const conn = CONNECTIONS[activeConnection];
+  const token = await getDataToken(activeConnection);
+  const transport = new StreamableHTTPClientTransport(new URL(conn.mcpUrl), { requestInit: { headers: { Authorization: `Bearer ${token}` } } });
   const client = new Client({ name: 'agentforce-today-remodel', version: '1.0.0' }, { capabilities: {} });
   await client.connect(transport);
   try { return await fn(client); } finally { try { await client.close(); } catch { /**/ } }
 }
 
-async function soql(query) {
+/** Run SOQL via MCP `soqlQuery` tool. */
+async function soqlViaMcp(query) {
   return withMcpClient(async (client) => {
-    const result = await client.callTool({ name: 'soqlQuery', arguments: { q: query.trim().replace(/\s+/g, ' ') } });
+    const result = await client.callTool({ name: 'soqlQuery', arguments: { q: query } });
     const text = result?.content?.find(c => c.type === 'text')?.text;
     if (!text) throw new Error('MCP returned no content');
     return JSON.parse(text);
   });
 }
 
+/** Run SOQL via the REST query endpoint. Fallback for any future Bearer-token
+ *  connection (no current mode uses it — MCP and CLI cover the active set). */
+async function soqlViaRest(query) {
+  const token = await getDataToken(activeConnection);
+  const instanceUrl = await getInstanceUrl(activeConnection);
+  const url = `${instanceUrl}/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(query)}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) {
+    const err = await res.text();
+    if (res.status === 401) { const e = new Error('REST query unauthorized'); e.code = 'NOT_AUTHENTICATED'; throw e; }
+    throw new Error(`REST query failed ${res.status}: ${err.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+/** Run SOQL via the `sf data query` CLI (no token extraction needed). */
+async function soqlViaCli(query) {
+  const conn = CONNECTIONS[activeConnection];
+  const args = ['data', 'query', '--query', query, '--json'];
+  if (conn.cliOrg) args.push('--target-org', conn.cliOrg);
+  // The `sf` CLI auto-reads SF_API_VERSION from the environment but wants a
+  // bare number (e.g. "60.0"), whereas our REST paths use the "v60.0" form.
+  // Normalize it for the child so dotenv's value doesn't break the CLI.
+  const childEnv = { ...process.env, SF_API_VERSION: SF_API_VERSION.replace(/^v/i, '') };
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync('sf', args, { maxBuffer: 8 * 1024 * 1024, env: childEnv }));
+  } catch (err) {
+    // `sf` writes a JSON error payload to stdout even on non-zero exit.
+    const payload = (err.stdout || '').toString();
+    let msg = (err.stderr || err.message || '').toString().slice(0, 200);
+    try { const j = JSON.parse(payload); if (j.message) msg = j.message; } catch { /* not json */ }
+    const e = new Error(`SF CLI query failed: ${msg}`);
+    e.code = 'NOT_AUTHENTICATED';
+    throw e;
+  }
+  const parsed = JSON.parse(stdout);
+  // Normalize to the REST/MCP shape: { records: [...], totalSize }
+  return parsed.result ?? parsed;
+}
+
+async function soql(query) {
+  const q = query.trim().replace(/\s+/g, ' ');
+  const conn = CONNECTIONS[activeConnection];
+  if (conn.transport === 'mcp') return soqlViaMcp(q);
+  if (conn.transport === 'cli') return soqlViaCli(q);
+  return soqlViaRest(q);
+}
+
 // ── Record Update (uses Models API token which has 'api' scope) ──────────────
 
 async function updateRecord(objectType, recordId, fields) {
   const token = await getModelsAccessToken();
-  const instanceUrl = auth.instanceUrl || SF_LOGIN_URL;
-  
-  const url = `${instanceUrl}/services/data/v60.0/sobjects/${objectType}/${recordId}`;
+  const instanceUrl = (await getInstanceUrl().catch(() => null)) || SF_LOGIN_URL;
+
+  const url = `${instanceUrl}/services/data/${SF_API_VERSION}/sobjects/${objectType}/${recordId}`;
   console.log(`  [REST API] PATCH ${url}`);
   
   const res = await fetch(url, {
@@ -499,9 +729,9 @@ async function updateRecord(objectType, recordId, fields) {
 
 async function createRecord(objectType, fields) {
   const token = await getModelsAccessToken();
-  const instanceUrl = auth.instanceUrl || SF_LOGIN_URL;
-  
-  const url = `${instanceUrl}/services/data/v60.0/sobjects/${objectType}`;
+  const instanceUrl = (await getInstanceUrl().catch(() => null)) || SF_LOGIN_URL;
+
+  const url = `${instanceUrl}/services/data/${SF_API_VERSION}/sobjects/${objectType}`;
   console.log(`  [REST API] POST ${url}`);
   
   const res = await fetch(url, {
@@ -828,6 +1058,7 @@ app.get('/api/today', requireAuth, async (req, res) => {
       date:    `${dayNames[now.getDay()]} ${monthNames[now.getMonth()]} ${now.getDate()}`,
       score:   aiResult.score ?? 100,
       aiEnabled: llmEnabled,
+      activeConnection,
       llmProvider,
       trustLayer: llmProvider === 'models-api',
       model:   modelId,
@@ -1055,7 +1286,7 @@ app.get('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`\n  Agentforce Today Remodel  →  http://localhost:${PORT}`);
-  console.log(`  MCP                       →  ${MCP_URL}`);
+  console.log(`  Data connections          →  ${Object.values(CONNECTIONS).map(c => `${c.id}${c.available ? '' : ' (unconfigured)'}${c.id === activeConnection ? ' [active]' : ''}`).join(', ')}`);
   const llmDesc = GW_URL ? `Gateway → ${GW_URL}` : anthropic ? 'Anthropic Claude (direct)' : 'fallback (no LLM configured)';
   console.log(`  AI / Chat                 →  ${llmDesc}\n`);
 });

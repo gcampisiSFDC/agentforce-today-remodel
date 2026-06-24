@@ -1,7 +1,9 @@
 import ModelSelector from './ModelSelector.jsx';
+import ConnectionSelector, { TransportIcon } from './ConnectionSelector.jsx';
 
-export default function Header({ model, models, modelOpen, onModelToggle, onModelChange, onRefresh, onLogout, loading, aiEnabled, llmProvider, trustLayer, onProviderToggle }) {
+export default function Header({ model, models, modelOpen, onModelToggle, onModelChange, onRefresh, onLogout, loading, aiEnabled, llmProvider, trustLayer, onProviderToggle, connections, activeConnection, connOpen, onConnToggle, onConnChange }) {
   const selectedModel = models.find(m => m.id === model);
+  const selectedConn = connections?.find(c => c.id === activeConnection);
 
   return (
     <header className="header">
@@ -37,6 +39,20 @@ export default function Header({ model, models, modelOpen, onModelToggle, onMode
             {trustLayer ? '✓' : '✗'}
           </span>
         </button>
+
+        {/* Data connection selector */}
+        {connections?.length > 0 && (
+          <div className="conn-trigger-wrap" onClick={onConnToggle}>
+            <button className="conn-trigger" type="button" title="Switch Salesforce data connection">
+              <TransportIcon transport={selectedConn?.transport ?? 'mcp'} size={13} />
+              <span className="conn-trigger-label">{selectedConn?.label ?? 'Connection'}</span>
+              <ChevronIcon open={connOpen} />
+            </button>
+            {connOpen && (
+              <ConnectionSelector connections={connections} active={activeConnection} onSelect={onConnChange} />
+            )}
+          </div>
+        )}
 
         <span className={`live-badge ${aiEnabled ? 'live-badge--on' : 'live-badge--off'}`}>
           <span className="live-dot" />
