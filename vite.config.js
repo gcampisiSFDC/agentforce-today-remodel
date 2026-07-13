@@ -6,8 +6,8 @@ export default defineConfig({
   server: {
     port: 5174,
     proxy: {
-      '/api': 'http://localhost:3334',
-      '/oauth': 'http://localhost:3334',
+      '/api': 'http://localhost:3335',
+      '/oauth': 'http://localhost:3335',
     },
   },
   build: {
