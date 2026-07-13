@@ -1,7 +1,7 @@
 import ModelSelector from './ModelSelector.jsx';
 import ConnectionSelector, { TransportIcon } from './ConnectionSelector.jsx';
 
-export default function Header({ model, models, modelOpen, onModelToggle, onModelChange, onRefresh, onLogout, loading, aiEnabled, llmProvider, trustLayer, onProviderToggle, connections, activeConnection, connOpen, onConnToggle, onConnChange }) {
+export default function Header({ model, models, modelOpen, onModelToggle, onModelChange, onRefresh, onLogout, loading, aiEnabled, llmProvider, trustLayer, onProviderToggle, connections, activeConnection, connOpen, onConnToggle, onConnChange, view, onViewChange }) {
   const selectedModel = models.find(m => m.id === model);
   const selectedConn = connections?.find(c => c.id === activeConnection);
 
@@ -21,7 +21,28 @@ export default function Header({ model, models, modelOpen, onModelToggle, onMode
           </div>
         </div>
         <span className="header-sep" />
-        <span className="header-nav">Sales · Pipeline</span>
+        <nav className="header-tabs">
+          <button
+            className={`header-tab ${view === 'dashboard' ? 'header-tab--active' : ''}`}
+            onClick={() => onViewChange?.('dashboard')}
+          >
+            Dashboard
+          </button>
+          <button
+            className={`header-tab ${view === 'events' ? 'header-tab--active' : ''}`}
+            onClick={() => onViewChange?.('events')}
+          >
+            <span className="header-tab-live-dot" />
+            Event Monitor
+          </button>
+          <button
+            className={`header-tab ${view === 'eca-trace' ? 'header-tab--active' : ''}`}
+            onClick={() => onViewChange?.('eca-trace')}
+          >
+            <span className="header-tab-live-dot" />
+            ECA Trace
+          </button>
+        </nav>
       </div>
 
       <div className="header-right">

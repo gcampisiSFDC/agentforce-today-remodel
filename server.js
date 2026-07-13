@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import { createHash, randomBytes } from 'crypto';
+import fs from 'fs';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
@@ -10,6 +11,24 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import Anthropic from '@anthropic-ai/sdk';
 
 const execFileAsync = promisify(execFile);
+
+// On Windows the `sf` CLI is a `.cmd` shim: Node's execFile can't launch a bare
+// `sf` (ENOENT — no extension resolution), and Node 22+ refuses to spawn a
+// `.cmd` without a shell. Running through a shell, in turn, would treat SOQL
+// characters like `>` as redirection. So on Windows we invoke `sf.cmd` via the
+// shell but hand it a single, fully double-quoted command line (SOQL literals
+// use single quotes, so double-quote wrapping is safe). Elsewhere we execFile
+// `sf` directly with the args array.
+const IS_WIN = process.platform === 'win32';
+
+async function runSf(args, opts = {}) {
+  if (!IS_WIN) return execFileAsync('sf', args, opts);
+  const quote = a => `"${String(a).replace(/"/g, '\\"')}"`;
+  const cmd = ['sf.cmd', ...args.map(quote)].join(' ');
+  // windowsVerbatimArguments: pass our pre-quoted command line through untouched
+  // — otherwise Node re-quotes each element and mangles the SOQL string.
+  return execFileAsync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', cmd], { ...opts, windowsVerbatimArguments: true });
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -21,6 +40,14 @@ const SF_CLIENT_ID  = process.env.SF_CLIENT_ID;
 // SF_CLIENT_ID — a single app can't hold valid mcp_api and api tokens at once
 // (the second authorization invalidates the first). Falls back to SF_CLIENT_ID.
 const SF_MODELS_CLIENT_ID = process.env.SF_MODELS_CLIENT_ID || SF_CLIENT_ID;
+// ── ECA Trace: a second tracked ECA (the locally-installed Salesforce DX MCP) ──
+// Its Event-Monitoring `Application` string is org-dependent, so it's
+// configurable. SF_DXMCP_CLIENT_ID is only used to surface (masked) in the UI.
+// ECA_LOGIN_LOOKBACK_HOURS bounds how far back logins are indexed for the
+// session-based attribution join (see correlateEcaTraffic).
+const SF_DXMCP_APP_NAME  = process.env.SF_DXMCP_APP_NAME  || 'Salesforce DX MCP';
+const SF_DXMCP_CLIENT_ID = process.env.SF_DXMCP_CLIENT_ID || '';
+const ECA_LOGIN_LOOKBACK_HOURS = parseInt(process.env.ECA_LOGIN_LOOKBACK_HOURS || '24', 10);
 const SF_LOGIN_URL  = process.env.SF_LOGIN_URL  || 'https://login.salesforce.com';
 const SF_TOKEN_URL  = process.env.SF_TOKEN_URL  || 'https://login.salesforce.com';
 const CALLBACK_URL  = process.env.CALLBACK_URL  || 'http://localhost:3334/oauth/callback';
@@ -34,21 +61,30 @@ const SF_API_VERSION = process.env.SF_API_VERSION || 'v60.0';
 // has a transport (how queries run) and an auth model (how it gets a token).
 //   - mcp  : query via the MCP `soqlQuery` tool over an HTTP transport
 //   - cli  : shell out to the `sf` CLI (the connected-app-backed local session)
-const EXTERNAL_MCP_URL = process.env.EXTERNAL_MCP_URL || '';
-const SF_CLI_ORG       = process.env.SF_CLI_ORG || '';
+// Auth models: 'oauth' (Salesforce ECA / PKCE), 'token' (a static bearer the
+// external server itself issues — NOT a Salesforce scope), 'cli' (local CLI).
+const EXTERNAL_MCP_URL   = process.env.EXTERNAL_MCP_URL || '';
+const EXTERNAL_MCP_TOKEN = process.env.EXTERNAL_MCP_TOKEN || '';
+const SF_CLI_ORG         = process.env.SF_CLI_ORG || '';
 
 const CONNECTIONS = {
+  // A third-party / self-hosted MCP server (e.g. the Salesforce DX MCP server,
+  // or any non-Salesforce MCP endpoint). It is NOT a Salesforce OAuth client, so
+  // it carries no `mcp_api`/ECA scopes — the server defines its own auth. We
+  // attach an optional bearer token (EXTERNAL_MCP_TOKEN) if the server wants one;
+  // servers that need no auth (or use the local CLI session, like the DX MCP
+  // server) just leave it blank. NOTE: this targets an HTTP-reachable MCP
+  // endpoint; a stdio-only server like `@salesforce/mcp` needs an HTTP bridge.
   'eca-external-mcp': {
     id: 'eca-external-mcp',
     label: 'External MCP Tools',
-    sublabel: 'ECA · third-party MCP',
+    sublabel: 'third-party MCP · own auth',
     transport: 'mcp',
-    auth: 'oauth',
-    clientId: process.env.EXTERNAL_MCP_CLIENT_ID || '',
-    scope: 'mcp_api refresh_token',
+    auth: 'token',
+    token: EXTERNAL_MCP_TOKEN,
     mcpUrl: EXTERNAL_MCP_URL,
-    // Available only once both an endpoint and a client id are configured.
-    get available() { return !!(this.clientId && this.mcpUrl); },
+    // Available once an endpoint is set — the token is optional (server's call).
+    get available() { return !!this.mcpUrl; },
   },
   'eca-sf-mcp': {
     id: 'eca-sf-mcp',
@@ -86,13 +122,70 @@ const GW_KEY   = process.env.LLM_GATEWAY_KEY   || '';
 const GW_USER  = process.env.LLM_GATEWAY_USER  || '';
 const GW_MODEL = process.env.LLM_GATEWAY_MODEL || 'claude-3-5-sonnet-20241022';
 
+// ── Bedrock-style gateway (Anthropic Messages API over an AWS Bedrock proxy) ──
+// The Salesforce internal model gateway that Claude Code / the Agent SDK uses
+// speaks the Anthropic Messages API at `{base}/model/{id}/invoke`, authed with a
+// bearer token instead of AWS SigV4. We reuse the same env vars that CLI sets
+// (ANTHROPIC_BEDROCK_BASE_URL + ANTHROPIC_AUTH_TOKEN) so launching the server
+// from an authenticated shell needs no secrets on disk. BEDROCK_GW_* overrides
+// win if you want to point at a different gateway/token explicitly.
+const BEDROCK_GW_URL   = (process.env.BEDROCK_GW_URL || process.env.ANTHROPIC_BEDROCK_BASE_URL || '').replace(/\/$/, '');
+// Bedrock model IDs verified against the gateway. The app's UI model ids map to
+// these; unmapped ids fall back to BEDROCK_GW_MODEL.
+const BEDROCK_GW_MODEL = process.env.BEDROCK_GW_MODEL || 'us.anthropic.claude-sonnet-4-5-20250929-v1:0';
+const BEDROCK_MODEL_MAP = {
+  'claude-opus-4-7':            'us.anthropic.claude-sonnet-4-5-20250929-v1:0', // opus-4-x not on this key
+  'claude-sonnet-4-6':          'us.anthropic.claude-sonnet-5',
+  'claude-sonnet-4-5-20250929': 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+  'claude-haiku-4-5-20251001':  'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+};
+
+// ── Bedrock token: live rotation sync ─────────────────────────────────────────
+// The gateway bearer (ANTHROPIC_AUTH_TOKEN) is short-lived and rotates. Claude
+// Code's tooling rewrites the new value into ~/.claude/settings.json, so we read
+// from there at call time rather than snapshotting the startup env — no restart
+// needed when it rotates. Precedence: explicit BEDROCK_GW_TOKEN override > the
+// settings.json value (freshest) > the process env at launch. A tiny TTL keeps
+// us from hitting disk on every request; on a 401 we force a re-read (below).
+const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
+let _bedrockTokenCache = { value: null, readAt: 0 };
+const BEDROCK_TOKEN_TTL = 60 * 1000;
+
+function readBedrockTokenFromSettings() {
+  try {
+    const raw = fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8');
+    return JSON.parse(raw)?.env?.ANTHROPIC_AUTH_TOKEN || '';
+  } catch { return ''; }
+}
+
+/** Current gateway bearer, honoring live rotation. `force` skips the TTL cache. */
+function getBedrockToken(force = false) {
+  if (process.env.BEDROCK_GW_TOKEN) return process.env.BEDROCK_GW_TOKEN;  // explicit override
+  const now = Date.now();
+  if (!force && _bedrockTokenCache.value && now - _bedrockTokenCache.readAt < BEDROCK_TOKEN_TTL) {
+    return _bedrockTokenCache.value;
+  }
+  // Prefer the on-disk value (rewritten on rotation); fall back to launch env.
+  const token = readBedrockTokenFromSettings() || process.env.ANTHROPIC_AUTH_TOKEN || '';
+  _bedrockTokenCache = { value: token, readAt: now };
+  return token;
+}
+
+/** Is the Bedrock gateway usable right now (URL + a resolvable token)? */
+function bedrockGwEnabled() { return !!(BEDROCK_GW_URL && getBedrockToken()); }
+
 const anthropic = (!GW_URL && ANTHROPIC_KEY) ? new Anthropic({ apiKey: ANTHROPIC_KEY }) : null;
-const llmEnabled = !!(GW_URL || anthropic);
+// Whether the *external* provider (Anthropic direct, the OpenAI-style gateway,
+// or the Bedrock-style gateway) is configured. The Models API provider is gated
+// separately, on ECA auth — see isLlmEnabled() below.
+function externalLlmEnabled() { return !!(GW_URL || anthropic || bedrockGwEnabled()); }
 
 // ── LLM Provider Toggle ─────────────────────────────────────────────────────
 // 'external' = Anthropic/Gateway (no Trust Layer)
 // 'models-api' = Salesforce Models API (Trust Layer applies)
-let llmProvider = 'external';
+// Defaults to the Salesforce Models API — the documented primary provider
+// (see .env). The external provider is opt-in via an Anthropic key / gateway.
+let llmProvider = process.env.DEFAULT_LLM_PROVIDER || 'models-api';
 
 // Salesforce Models API configuration
 const SF_MODELS_API_MODEL = process.env.SF_MODELS_API_MODEL || 'sfdc_ai__DefaultOpenAIGPT4OmniMini';
@@ -205,6 +298,61 @@ async function sfModelsApiStream(systemPrompt, messages, res) {
   }
 }
 
+/** Resolve an app model id to a Bedrock model id the gateway serves. */
+function bedrockModelFor(modelId) {
+  return BEDROCK_MODEL_MAP[modelId] || BEDROCK_GW_MODEL;
+}
+
+/** One call to the Bedrock gateway with a specific token. Returns the Response.*/
+async function bedrockGwFetch(systemPrompt, messages, modelId, token) {
+  const model = bedrockModelFor(modelId);
+  const url = `${BEDROCK_GW_URL}/model/${encodeURIComponent(model)}/invoke`;
+  return fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      anthropic_version: 'bedrock-2023-05-31',
+      max_tokens: 2048,
+      system: systemPrompt,
+      messages,
+    }),
+  });
+}
+
+/** Call the Bedrock-style gateway (Anthropic Messages API), non-streaming.
+ *  Resolves the bearer token live (see getBedrockToken) so a rotated token is
+ *  picked up without a restart; on a 401/403 we force-refresh from settings.json
+ *  and retry once, covering the case where the token rotated mid-cache-window.
+ *  Returns the concatenated text of all text blocks (skips `thinking` blocks
+ *  that reasoning models like sonnet-5 emit first). */
+async function bedrockGwInvoke(systemPrompt, messages, modelId) {
+  let res = await bedrockGwFetch(systemPrompt, messages, modelId, getBedrockToken());
+
+  if (res.status === 401 || res.status === 403) {
+    const fresh = getBedrockToken(true);  // rotation? re-read settings.json now
+    console.log('  [Bedrock] auth rejected — re-read token from settings.json, retrying');
+    res = await bedrockGwFetch(systemPrompt, messages, modelId, fresh);
+  }
+
+  if (!res.ok) {
+    const err = await res.text();
+    if (res.status === 401 || res.status === 403) {
+      const e = new Error(`Bedrock gateway auth failed (${res.status}) — token expired; relaunch an authenticated Claude Code shell`);
+      e.code = 'NOT_AUTHENTICATED';
+      throw e;
+    }
+    throw new Error(`Bedrock gateway error ${res.status}: ${err.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  return (data.content ?? [])
+    .filter(b => b.type === 'text')
+    .map(b => b.text)
+    .join('');
+}
+
 /** Non-streaming completion — returns the assistant message text. */
 async function llmComplete(systemPrompt, userContent, modelId) {
   // Route to Salesforce Models API if that provider is selected
@@ -212,8 +360,19 @@ async function llmComplete(systemPrompt, userContent, modelId) {
     console.log(`  [LLM] Using Salesforce Models API (Trust Layer ✅)`);
     return sfModelsApiComplete(systemPrompt, userContent);
   }
-  
+
+  // Bedrock-style gateway (the credential Claude Code / the Agent SDK uses).
+  if (bedrockGwEnabled()) {
+    console.log(`  [LLM] Using Bedrock gateway → ${bedrockModelFor(modelId)} (Trust Layer ❌)`);
+    return bedrockGwInvoke(systemPrompt, [{ role: 'user', content: userContent }], modelId);
+  }
+
   console.log(`  [LLM] Using external provider (Trust Layer ❌)`);
+  return llmCompleteExternal(systemPrompt, userContent, modelId);
+}
+
+/** Legacy external paths: OpenAI-style gateway, then Anthropic direct. */
+async function llmCompleteExternal(systemPrompt, userContent, modelId) {
   if (GW_URL) {
     const res = await fetch(`${GW_URL}/v1/chat/completions`, {
       method:  'POST',
@@ -265,6 +424,28 @@ async function llmStream(systemPrompt, messages, modelId, res) {
   res.flushHeaders();
 
   const write = text => res.write(`data: ${JSON.stringify({ text })}\n\n`);
+
+  // Bedrock-style gateway. Its native stream is AWS eventstream binary framing,
+  // which is fragile to hand-parse — so we call the clean /invoke once and
+  // simulate word chunks for a consistent streaming UX (same as Models API).
+  if (bedrockGwEnabled()) {
+    console.log(`  [LLM Stream] Using Bedrock gateway → ${bedrockModelFor(modelId)} (Trust Layer ❌)`);
+    try {
+      const text = await bedrockGwInvoke(systemPrompt, messages, modelId);
+      const words = text.split(' ');
+      for (let i = 0; i < words.length; i += 3) {
+        write(words.slice(i, i + 3).join(' ') + ' ');
+        await new Promise(r => setTimeout(r, 20));
+      }
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } catch (err) {
+      write(`\n\n[Bedrock gateway error: ${err.message}]`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
+    return;
+  }
 
   if (GW_URL) {
     const fetchRes = await fetch(`${GW_URL}/v1/chat/completions`, {
@@ -350,12 +531,20 @@ function isConnectionAuthenticated(id = activeConnection) {
   const conn = CONNECTIONS[id];
   if (!conn) return false;
   if (conn.auth === 'cli') return conn.available;      // assume CLI session exists
+  if (conn.auth === 'token') return conn.available;    // external server owns auth
   const a = connAuth[id];
   return !!(a && (a.accessToken || a.refreshToken));
 }
 
 function isAuthenticated() { return isConnectionAuthenticated(activeConnection); }
 function isModelsAuthenticated() { return !!(authModels.accessToken || authModels.refreshToken); }
+
+/** Is an LLM ready to generate briefings/chat for the *current* provider?
+ *  - models-api: needs the Models API ECA authenticated (sfap_api/api token).
+ *  - external:   needs a gateway URL or an Anthropic key configured. */
+function isLlmEnabled() {
+  return llmProvider === 'models-api' ? isModelsAuthenticated() : externalLlmEnabled();
+}
 
 /** Resolve instance URL for the active connection (for REST calls). */
 async function getInstanceUrl(id = activeConnection) {
@@ -374,6 +563,10 @@ async function getDataToken(id = activeConnection) {
   if (conn.auth === 'cli') {
     const e = new Error('CLI connection does not provide a bearer token'); e.code = 'NOT_AUTHENTICATED'; throw e;
   }
+
+  // A 'token' connection (third-party / self-hosted MCP) carries a static bearer
+  // the external server itself issued, if any. May be empty for no-auth servers.
+  if (conn.auth === 'token') return conn.token || '';
 
   const a = connAuth[id];
   if (a.accessToken && Date.now() < a.expiresAt) return a.accessToken;
@@ -411,7 +604,7 @@ async function cliOrgInfo(org) {
     if (org) args.push('--target-org', org);
     let stdout;
     try {
-      ({ stdout } = await execFileAsync('sf', args, { maxBuffer: 1024 * 1024 }));
+      ({ stdout } = await runSf(args, { maxBuffer: 1024 * 1024 }));
     } catch (err) {
       const detail = (err.stderr || err.message || '').toString().slice(0, 200);
       const e = new Error(`SF CLI not available or org not authenticated: ${detail}`);
@@ -634,19 +827,100 @@ app.post('/api/llm/use-models-api', (req, res) => {
 async function withMcpClient(fn) {
   const conn = CONNECTIONS[activeConnection];
   const token = await getDataToken(activeConnection);
-  const transport = new StreamableHTTPClientTransport(new URL(conn.mcpUrl), { requestInit: { headers: { Authorization: `Bearer ${token}` } } });
+  // Only send an Authorization header if we actually have a token — a no-auth
+  // external MCP server gets a clean request.
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const transport = new StreamableHTTPClientTransport(new URL(conn.mcpUrl), { requestInit: { headers } });
   const client = new Client({ name: 'agentforce-today-remodel', version: '1.0.0' }, { capabilities: {} });
   await client.connect(transport);
   try { return await fn(client); } finally { try { await client.close(); } catch { /**/ } }
+}
+
+/**
+ * Parse SOQL tool output from MCP servers that may return:
+ * - strict JSON text
+ * - markdown-fenced JSON
+ * - JSON embedded in explanatory text
+ * - a structured object in content/data fields
+ */
+function parseMcpSoqlResult(result) {
+  const extractText = (value) => {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.map(extractText).filter(Boolean).join('\n');
+    if (typeof value === 'object') {
+      if (typeof value.text === 'string') return value.text;
+      if (typeof value.content === 'string') return value.content;
+      if (typeof value.value === 'string') return value.value;
+      if (typeof value.data === 'string') return value.data;
+      if (value.content || value.data) return extractText(value.content || value.data);
+    }
+    return '';
+  };
+
+  const tryParseJsonText = (text) => {
+    if (!text) return null;
+    const trimmed = text.trim();
+    if (!trimmed) return null;
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      // Common model/tool wrapper: ```json ... ```
+      const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+      if (fenced?.[1]) {
+        try { return JSON.parse(fenced[1]); } catch { /* keep trying */ }
+      }
+      // Recover first JSON object/array from mixed text.
+      const firstObj = trimmed.indexOf('{');
+      const firstArr = trimmed.indexOf('[');
+      const startCandidates = [firstObj, firstArr].filter(i => i >= 0);
+      if (!startCandidates.length) return null;
+      const start = Math.min(...startCandidates);
+      const endObj = trimmed.lastIndexOf('}');
+      const endArr = trimmed.lastIndexOf(']');
+      const end = Math.max(endObj, endArr);
+      if (end > start) {
+        const candidate = trimmed.slice(start, end + 1);
+        try { return JSON.parse(candidate); } catch { /* not parseable */ }
+      }
+      return null;
+    }
+  };
+
+  // Some MCP servers return structured content directly.
+  if (typeof result?.structuredContent === 'object' && result.structuredContent) {
+    return result.structuredContent;
+  }
+  if (typeof result?.data === 'object' && result.data) {
+    return result.data;
+  }
+
+  const textFromContent = extractText(result?.content);
+  const parsedFromContent = tryParseJsonText(textFromContent);
+  if (parsedFromContent) return parsedFromContent;
+
+  const parsedFromResultText = tryParseJsonText(result?.text);
+  if (parsedFromResultText) return parsedFromResultText;
+
+  // Last-ditch: if the first content item has an object `data`, use it.
+  const contentData = result?.content?.find?.(c => c && typeof c.data === 'object')?.data;
+  if (contentData) return contentData;
+
+  const preview = (textFromContent || result?.text || '').toString().slice(0, 200).replace(/\s+/g, ' ');
+  throw new Error(`MCP returned non-JSON SOQL payload${preview ? `: ${preview}` : ''}`);
 }
 
 /** Run SOQL via MCP `soqlQuery` tool. */
 async function soqlViaMcp(query) {
   return withMcpClient(async (client) => {
     const result = await client.callTool({ name: 'soqlQuery', arguments: { q: query } });
-    const text = result?.content?.find(c => c.type === 'text')?.text;
-    if (!text) throw new Error('MCP returned no content');
-    return JSON.parse(text);
+    const parsed = parseMcpSoqlResult(result);
+    // Normalize several likely server payload shapes to { records, totalSize }.
+    if (Array.isArray(parsed?.records)) return parsed;
+    if (Array.isArray(parsed?.result?.records)) return parsed.result;
+    if (Array.isArray(parsed?.data?.records)) return parsed.data;
+    if (Array.isArray(parsed)) return { records: parsed, totalSize: parsed.length };
+    throw new Error('MCP SOQL payload missing records array');
   });
 }
 
@@ -674,19 +948,64 @@ async function soqlViaCli(query) {
   // bare number (e.g. "60.0"), whereas our REST paths use the "v60.0" form.
   // Normalize it for the child so dotenv's value doesn't break the CLI.
   const childEnv = { ...process.env, SF_API_VERSION: SF_API_VERSION.replace(/^v/i, '') };
+  const parseSfCliJson = (raw) => {
+    const stripAnsi = s => s.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+    const text = stripAnsi((raw || '').toString())
+      .replace(/^\uFEFF/, '')        // UTF-8 BOM
+      .replace(/\u0000/g, '')        // stray NUL bytes
+      .trim();
+    if (!text) throw new Error('Empty SF CLI output');
+    try { return JSON.parse(text); } catch {
+      // Recover JSON from mixed/noisy stdout (warnings, prefixes, etc.).
+      const firstObj = text.indexOf('{');
+      const firstArr = text.indexOf('[');
+      const starts = [firstObj, firstArr].filter(i => i >= 0);
+      if (!starts.length) throw new Error('SF CLI did not return JSON');
+      const start = Math.min(...starts);
+      const endObj = text.lastIndexOf('}');
+      const endArr = text.lastIndexOf(']');
+      const end = Math.max(endObj, endArr);
+      if (end <= start) throw new Error('SF CLI JSON payload is truncated');
+      return JSON.parse(text.slice(start, end + 1));
+    }
+  };
   let stdout;
   try {
-    ({ stdout } = await execFileAsync('sf', args, { maxBuffer: 8 * 1024 * 1024, env: childEnv }));
+    ({ stdout } = await runSf(args, { maxBuffer: 8 * 1024 * 1024, env: childEnv }));
   } catch (err) {
-    // `sf` writes a JSON error payload to stdout even on non-zero exit.
+    // `sf` writes its JSON payload to stdout even on non-zero exit. On Windows
+    // the cmd.exe wrapper can also exit non-zero for a *successful* query — a
+    // deprecation/api-version warning on stderr flips the exit code even though
+    // stdout holds a clean `{ status: 0, result: {...} }`. So try to recover a
+    // successful payload from stdout before treating this as a real failure.
     const payload = (err.stdout || '').toString();
-    let msg = (err.stderr || err.message || '').toString().slice(0, 200);
-    try { const j = JSON.parse(payload); if (j.message) msg = j.message; } catch { /* not json */ }
-    const e = new Error(`SF CLI query failed: ${msg}`);
-    e.code = 'NOT_AUTHENTICATED';
-    throw e;
+    try {
+      const j = parseSfCliJson(payload);
+      if (j.status === 0 && j.result) return j.result;   // genuine success despite exit code
+      const e = new Error(`SF CLI query failed: ${(j.message || 'unknown error').slice(0, 200)}`);
+      e.code = 'NOT_AUTHENTICATED';
+      throw e;
+    } catch (parseErr) {
+      if (parseErr.code === 'NOT_AUTHENTICATED') throw parseErr;
+      if (payload) {
+        console.log(`  [CLI] Non-JSON stdout on non-zero exit (preview): ${payload.slice(0, 220).replace(/\s+/g, ' ')}`);
+      }
+      const msg = (err.stderr || err.message || '').toString().slice(0, 200);
+      const e = new Error(`SF CLI query failed: ${msg}`);
+      e.code = 'NOT_AUTHENTICATED';
+      throw e;
+    }
   }
-  const parsed = JSON.parse(stdout);
+  let parsed;
+  try {
+    parsed = parseSfCliJson(stdout);
+  } catch (err) {
+    const raw = (stdout || '').toString();
+    const charCodes = raw.slice(0, 12).split('').map(ch => ch.charCodeAt(0)).join(',');
+    console.log(`  [CLI] JSON parse failed for stdout preview: ${raw.slice(0, 220).replace(/\s+/g, ' ')}`);
+    console.log(`  [CLI] stdout first char codes: ${charCodes}`);
+    throw err;
+  }
   // Normalize to the REST/MCP shape: { records: [...], totalSize }
   return parsed.result ?? parsed;
 }
@@ -828,7 +1147,7 @@ Rules:
 - Score reflects pipeline risk: 200 = perfect health, 0 = all at risk.`;
 
 async function generateBriefings(sfData, modelId) {
-  if (!llmEnabled) return fallbackBriefings(sfData);
+  if (!isLlmEnabled()) return fallbackBriefings(sfData);
 
   const dataStr = JSON.stringify({
     openOpportunities: sfData.opportunities,
@@ -1057,7 +1376,7 @@ app.get('/api/today', requireAuth, async (req, res) => {
     res.json({
       date:    `${dayNames[now.getDay()]} ${monthNames[now.getMonth()]} ${now.getDate()}`,
       score:   aiResult.score ?? 100,
-      aiEnabled: llmEnabled,
+      aiEnabled: isLlmEnabled(),
       activeConnection,
       llmProvider,
       trustLayer: llmProvider === 'models-api',
@@ -1240,8 +1559,11 @@ app.post('/api/create-record', requireAuth, async (req, res) => {
 // ── Chat endpoint (streaming SSE) ───────────────────────────────────────────
 
 app.post('/api/chat', requireAuth, async (req, res) => {
-  if (!llmEnabled) {
-    return res.status(501).json({ error: 'LLM_NOT_CONFIGURED', message: 'Set LLM_GATEWAY_URL + LLM_GATEWAY_KEY (or ANTHROPIC_API_KEY) in .env to enable chat.' });
+  if (!isLlmEnabled()) {
+    const message = llmProvider === 'models-api'
+      ? 'Models API selected but not authenticated. Connect the Models API ECA via /oauth/models-login, or set an Anthropic key / gateway and switch to the external provider.'
+      : 'Set LLM_GATEWAY_URL + LLM_GATEWAY_KEY (or ANTHROPIC_API_KEY) in .env to enable chat.';
+    return res.status(501).json({ error: 'LLM_NOT_CONFIGURED', message, provider: llmProvider });
   }
 
   const { messages = [], model: modelId } = req.body;
@@ -1273,6 +1595,480 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   }
 });
 
+// ── Real-Time Event Monitoring ────────────────────────────────────────────────
+// The heart of the demo: stream Salesforce Event Monitoring logs live and show
+// how each *connection type* the app uses surfaces (or fails to surface) in them.
+//
+// Findings verified against the dxdo org:
+//   • LoginEvent.Application is the reliable discriminator — it reads
+//     "SF MCP", "SF MODELS", "Salesforce CLI" or "Browser", mapping 1:1 to the
+//     app's connection types (eca-sf-mcp, Models API, cli, and the user login).
+//   • ApiEvent rows produced by MCP- and CLI-routed queries carry
+//     ConnectedAppId = null and Application = "N/A" — the observability gap the
+//     README calls out. We surface that per row so it's visible, not hidden.
+//   • These are queryable big objects: filterable by EventDate (NOT by
+//     ConnectedAppId, which is select-only), so we poll by EventDate and
+//     classify/filter the connection client-side.
+
+const EVENTS_POLL_MS = parseInt(process.env.EVENTS_POLL_MS || '6000', 10);
+
+// Event types we stream. `fields` are verified-present columns; `time` is the
+// timestamp column to page on (all use EventDate here).
+const EVENT_TYPES = {
+  LoginEvent: {
+    label: 'Login',
+    fields: 'EventIdentifier, EventDate, Username, Application, LoginType, Browser, Platform, Status, SourceIp, SessionKey, LoginHistoryId, LoginKey',
+  },
+  LoginAsEvent: {
+    label: 'Login-As',
+    fields: 'EventIdentifier, EventDate, Username, DelegatedUsername, Application, LoginType, SourceIp, SessionKey, LoginHistoryId, LoginKey',
+  },
+  ApiEvent: {
+    label: 'API',
+    fields: 'EventIdentifier, EventDate, Username, Application, ConnectedAppId, Operation, QueriedEntities, ApiType, RowsReturned, RowsProcessed, SourceIp, SessionKey, LoginHistoryId, LoginKey',
+  },
+  LogoutEvent: {
+    label: 'Logout',
+    fields: 'EventIdentifier, EventDate, Username, SourceIp',
+  },
+  ReportEvent: {
+    label: 'Report',
+    fields: 'EventIdentifier, EventDate, Username, Operation, QueriedEntities',
+  },
+  LightningUriEvent: {
+    label: 'Lightning UI',
+    fields: 'EventIdentifier, EventDate, Username, Operation, AppName, PageUrl',
+  },
+};
+
+// Tracked External Client Apps for the ECA Trace view. Each is an ECA whose
+// individual API calls carry no ConnectedAppId (Remote Access 2.0 login), so we
+// attribute their traffic by correlating on session identifiers instead.
+const TRACKED_ECAS = {
+  'sf-mcp': { id: 'sf-mcp', label: 'Hosted MCP',        appName: 'SF MCP',          clientId: SF_CLIENT_ID },
+  'dx-mcp': { id: 'dx-mcp', label: 'Salesforce DX MCP', appName: SF_DXMCP_APP_NAME, clientId: SF_DXMCP_CLIENT_ID },
+};
+// Generic Application strings that must never be treated as a tracked ECA — even
+// if an operator misconfigures SF_DXMCP_APP_NAME to one of them. Guards the
+// exact-name match in classifyConnection so a shared name stays ambiguous.
+const RESERVED_APP_NAMES = new Set(['SALESFORCE CLI', 'BROWSER', 'SF MODELS', 'N/A']);
+
+// How each connection surfaces in Event Monitoring. Drives the UI legend.
+const CONNECTION_LEGEND = {
+  'sf-mcp':    { label: 'Salesforce MCP',   sublabel: 'ECA · mcp_api',     match: 'Application = "SF MCP"',       tracesToApp: false },
+  'sf-models': { label: 'Models API',       sublabel: 'ECA · sfap_api/api', match: 'Application = "SF MODELS"',   tracesToApp: true  },
+  'dx-mcp':    { label: 'Salesforce DX MCP', sublabel: 'ECA · local CLI',  match: `Application = "${SF_DXMCP_APP_NAME}"`, tracesToApp: false },
+  'cli':       { label: 'Connected App',    sublabel: 'sf CLI session',    match: 'Application = "Salesforce CLI"', tracesToApp: true  },
+  'browser':   { label: 'User (Browser)',   sublabel: 'interactive login', match: 'Application = "Browser"',      tracesToApp: true  },
+  'other':     { label: 'Other',            sublabel: 'unrelated traffic', match: '—',                            tracesToApp: null  },
+};
+
+/** Map an Event Monitoring Application/AppName to one of the app's connection types. */
+function classifyConnection(application) {
+  const raw = (application || '').trim();
+  const a = raw.toUpperCase();
+  // Match the exact configured DX MCP app name FIRST so its (possibly generic-
+  // looking) string isn't swallowed by the includes() rules below — but refuse
+  // to honour a reserved/ambiguous name (see edge cases: DX MCP vs CLI).
+  const dxName = (SF_DXMCP_APP_NAME || '').trim().toUpperCase();
+  if (dxName && a === dxName && !RESERVED_APP_NAMES.has(dxName)) return 'dx-mcp';
+  if (a.includes('MCP'))     return 'sf-mcp';
+  if (a.includes('MODEL'))   return 'sf-models';
+  if (a.includes('CLI'))     return 'cli';
+  if (a.includes('BROWSER')) return 'browser';
+  return 'other';
+}
+
+/** Flatten a raw event record into the shape the frontend renders. */
+function normalizeEvent(type, r) {
+  const application = r.Application ?? r.AppName ?? null;
+  const connection = classifyConnection(application);
+  // The "observability gap": an ApiEvent whose originating connected app can't
+  // be identified (ConnectedAppId null / Application N/A) is untraceable to the
+  // app that made the call — exactly what happens for MCP- and CLI-routed calls.
+  const hasConnectedApp = !!(r.ConnectedAppId && r.ConnectedAppId !== 'null');
+  const appTraceable = type === 'ApiEvent'
+    ? hasConnectedApp
+    : (CONNECTION_LEGEND[connection]?.tracesToApp ?? null);
+
+  return {
+    id:              r.EventIdentifier || `${type}-${r.EventDate}-${Math.round((new Date(r.EventDate)).getTime())}`,
+    type,
+    typeLabel:       EVENT_TYPES[type]?.label ?? type,
+    eventDate:       r.EventDate,
+    username:        r.Username ?? null,
+    application,
+    connection,
+    connectionLabel: CONNECTION_LEGEND[connection]?.label ?? connection,
+    connectedAppId:  r.ConnectedAppId ?? null,
+    appTraceable,
+    // Type-specific detail (only what's set for that type comes through).
+    loginType:       r.LoginType ?? null,
+    status:          r.Status ?? null,
+    browser:         r.Browser ?? null,
+    platform:        r.Platform ?? null,
+    operation:       r.Operation ?? null,
+    queriedEntities: r.QueriedEntities ?? null,
+    apiType:         r.ApiType ?? null,
+    rowsReturned:    r.RowsReturned ?? null,
+    delegatedUser:   r.DelegatedUsername ?? null,
+    pageUrl:         r.PageUrl ?? null,
+    sourceIp:        r.SourceIp ?? null,
+    // Session identifiers — the join keys for ECA Trace attribution. Harmless
+    // nulls on event types that don't carry them.
+    sessionKey:      r.SessionKey ?? null,
+    loginHistoryId:  r.LoginHistoryId ?? null,
+    loginKey:        r.LoginKey ?? null,
+  };
+}
+
+/** Query one event type since an ISO timestamp (inclusive). Returns [] on any
+ *  per-type failure so one unavailable object doesn't kill the whole stream. */
+async function fetchEventType(type, sinceIso, limit = 50) {
+  const def = EVENT_TYPES[type];
+  if (!def) return [];
+  // EventDate is filterable; ConnectedAppId is not — so we page purely on time.
+  const where = sinceIso ? `WHERE EventDate > ${sinceIso}` : '';
+  const q = `SELECT ${def.fields} FROM ${type} ${where} ORDER BY EventDate DESC LIMIT ${limit}`;
+  try {
+    const res = await soql(q);
+    return (res?.records ?? []).map(r => normalizeEvent(type, r));
+  } catch (err) {
+    // A type may be unavailable on the org/edition, or unauthorized — skip it
+    // rather than failing the whole stream. Logged at debug depth only.
+    if (process.env.EVENTS_DEBUG) console.log(`  [events] ${type} skipped: ${err.message?.slice(0, 160)}`);
+    return [];
+  }
+}
+
+/** Fetch a batch across the requested types, newest first. */
+async function fetchEvents({ types, sinceIso, perTypeLimit = 40 }) {
+  const wanted = (types && types.length) ? types.filter(t => EVENT_TYPES[t]) : Object.keys(EVENT_TYPES);
+  const batches = await Promise.all(wanted.map(t => fetchEventType(t, sinceIso, perTypeLimit)));
+  return batches.flat().sort((a, b) => new Date(b.eventDate) - new Date(a.eventDate));
+}
+
+// Static metadata for the UI: the type registry + connection legend + which
+// connected-app client IDs the app itself uses.
+app.get('/api/events/meta', (req, res) => {
+  res.json({
+    types: Object.entries(EVENT_TYPES).map(([id, d]) => ({ id, label: d.label })),
+    connections: Object.entries(CONNECTION_LEGEND).map(([id, d]) => ({ id, ...d })),
+    pollMs: EVENTS_POLL_MS,
+    activeConnection,
+    appClientIds: {
+      mcp:    SF_CLIENT_ID ? `…${SF_CLIENT_ID.slice(-8)}` : null,
+      models: SF_MODELS_CLIENT_ID ? `…${SF_MODELS_CLIENT_ID.slice(-8)}` : null,
+      dxMcp:  SF_DXMCP_CLIENT_ID ? `…${SF_DXMCP_CLIENT_ID.slice(-8)}` : null,
+    },
+    // The ECAs the ECA Trace view attributes traffic to. One meta fetch serves
+    // both the Event Monitor and the ECA Trace tab.
+    trackedEcas: Object.values(TRACKED_ECAS).map(e => ({
+      id: e.id, label: e.label, appName: e.appName,
+      clientIdMasked: e.clientId ? `…${e.clientId.slice(-8)}` : null,
+    })),
+  });
+});
+
+// One-shot pull (backfill / manual refresh).
+app.get('/api/events', requireAuth, async (req, res) => {
+  const types = (req.query.types ? String(req.query.types).split(',') : []).map(s => s.trim()).filter(Boolean);
+  const hours = Math.min(parseInt(req.query.hours || '24', 10) || 24, 24 * 30);
+  const sinceIso = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+  try {
+    const events = await fetchEvents({ types, sinceIso, perTypeLimit: 60 });
+    res.json({ events, activeConnection, count: events.length });
+  } catch (err) {
+    console.error('[/api/events] error:', err.message);
+    if (err.code === 'NOT_AUTHENTICATED') return res.status(401).json({ error: 'NOT_AUTHENTICATED', loginUrl: '/oauth/login' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live SSE stream. Backfills recent events, then polls for anything newer and
+// pushes only rows not already seen (deduped by EventIdentifier).
+app.get('/api/events/stream', requireAuth, async (req, res) => {
+  const types = (req.query.types ? String(req.query.types).split(',') : []).map(s => s.trim()).filter(Boolean);
+  const backfillHours = Math.min(parseInt(req.query.hours || '6', 10) || 6, 24 * 7);
+
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  const seen = new Set();
+  const remember = ev => { seen.add(ev.id); if (seen.size > 5000) seen.clear(); };
+  let watermark = new Date(Date.now() - backfillHours * 3600 * 1000).toISOString();
+  let closed = false;
+  let timer = null;
+
+  send('status', { message: 'connected', activeConnection, pollMs: EVENTS_POLL_MS });
+
+  async function poll(isBackfill) {
+    if (closed) return;
+    try {
+      const events = await fetchEvents({ types, sinceIso: watermark, perTypeLimit: isBackfill ? 60 : 30 });
+      const fresh = events.filter(e => !seen.has(e.id));
+      fresh.forEach(remember);
+      // Advance the watermark to the newest event we've seen.
+      for (const e of fresh) { if (e.eventDate && e.eventDate > watermark) watermark = e.eventDate; }
+      if (fresh.length) {
+        // Oldest-first so the client appends in chronological order.
+        send('events', { events: fresh.slice().reverse(), backfill: !!isBackfill, activeConnection });
+      } else if (!isBackfill) {
+        send('heartbeat', { at: watermark, activeConnection });
+      }
+    } catch (err) {
+      send('error', { message: err.message, code: err.code || null });
+    }
+  }
+
+  await poll(true);
+  timer = setInterval(() => poll(false), EVENTS_POLL_MS);
+
+  req.on('close', () => { closed = true; if (timer) clearInterval(timer); try { res.end(); } catch { /**/ } });
+});
+
+// ── Real-Time Event Monitoring — ECA Trace ─────────────────────────────────────
+// Closes the observability gap the Event Monitor exposes. ApiEvent.ConnectedAppId
+// is only stamped for classic Connected Apps — the tracked ECAs (Hosted MCP, DX
+// MCP) log in as Remote Access 2.0, so their individual API calls carry no
+// ConnectedAppId. We instead attribute each ApiEvent to an ECA by correlating on
+// session identifiers (SessionKey → LoginHistoryId → LoginKey) shared with the
+// LoginEvent that started the session. LoginEvent/ApiEvent are filterable ONLY by
+// EventDate, so the correlation is a JS post-fetch join, never a SOQL WHERE.
+
+function newEcaIndex() {
+  return { bySession: new Map(), byHistory: new Map(), byLoginKey: new Map(), logins: [] };
+}
+
+/** Index tracked-ECA logins by their session identifiers. First-seen wins on a
+ *  key collision; callers pass logins newest-first (fetchEvents sorts DESC), so
+ *  the newest login owns a reused key. Returns how many tracked logins were added. */
+function indexEcaLogins(index, loginEvents) {
+  let added = 0;
+  for (const login of loginEvents) {
+    const ecaId = classifyConnection(login.application);
+    if (ecaId !== 'sf-mcp' && ecaId !== 'dx-mcp') continue;   // only tracked ECAs
+    const entry = { ecaId, login };
+    if (login.sessionKey     && !index.bySession.has(login.sessionKey))     index.bySession.set(login.sessionKey, entry);
+    if (login.loginHistoryId && !index.byHistory.has(login.loginHistoryId)) index.byHistory.set(login.loginHistoryId, entry);
+    if (login.loginKey       && !index.byLoginKey.has(login.loginKey))      index.byLoginKey.set(login.loginKey, entry);
+    index.logins.push(entry);
+    added++;
+  }
+  return added;
+}
+
+/** Attribute one ApiEvent to a tracked ECA via the session-id join, in priority
+ *  order. Returns { ecaId, login, matchedKey } or null (→ the observability gap). */
+function attributeApiEvent(index, ev) {
+  if (ev.sessionKey     && index.bySession.has(ev.sessionKey))     return { ...index.bySession.get(ev.sessionKey),     matchedKey: 'session' };
+  if (ev.loginHistoryId && index.byHistory.has(ev.loginHistoryId)) return { ...index.byHistory.get(ev.loginHistoryId), matchedKey: 'history' };
+  if (ev.loginKey       && index.byLoginKey.has(ev.loginKey))      return { ...index.byLoginKey.get(ev.loginKey),      matchedKey: 'login'   };
+  return null;
+}
+
+function trackedEcaSummary() {
+  return Object.values(TRACKED_ECAS).map(e => ({
+    id: e.id, label: e.label, appName: e.appName,
+    clientIdMasked: e.clientId ? `…${e.clientId.slice(-8)}` : null,
+  }));
+}
+
+const splitEntities = qe => (qe ? String(qe).split(',').map(s => s.trim()).filter(Boolean) : []);
+
+/** Build the full TraceResult snapshot from an index of logins + a list of
+ *  ApiEvents. Re-attributes every ApiEvent against the current index, so a login
+ *  that arrived after its ApiEvent moves the row into its group on the next build. */
+function buildTraceResult({ index, apiEvents, rawLoginCount, window }) {
+  const groups = new Map();
+  const ensureGroup = (ecaId) => {
+    if (!groups.has(ecaId)) {
+      const eca = TRACKED_ECAS[ecaId];
+      groups.set(ecaId, {
+        ecaId, label: eca?.label ?? ecaId, appName: eca?.appName ?? null,
+        sessions: new Map(), apiEvents: [], entities: new Set(), operations: {},
+      });
+    }
+    return groups.get(ecaId);
+  };
+
+  // Seed each group with its captured sessions so a group with logins but no
+  // (yet) attributed API calls still renders.
+  for (const entry of index.logins) {
+    const g = ensureGroup(entry.ecaId);
+    const l = entry.login;
+    const skey = l.sessionKey || l.loginHistoryId || l.loginKey || l.id;
+    if (!g.sessions.has(skey)) {
+      g.sessions.set(skey, {
+        sessionKey: l.sessionKey, loginHistoryId: l.loginHistoryId, loginKey: l.loginKey,
+        username: l.username, loginAt: l.eventDate, loginType: l.loginType, sourceIp: l.sourceIp,
+      });
+    }
+  }
+
+  const unattr = { apiEvents: [], entities: new Set() };
+  for (const ev of apiEvents) {
+    const match = attributeApiEvent(index, ev);
+    if (match) {
+      const g = ensureGroup(match.ecaId);
+      g.apiEvents.push({ ...ev, attributedTo: match.ecaId, matchedKey: match.matchedKey });
+      splitEntities(ev.queriedEntities).forEach(e => g.entities.add(e));
+      const op = ev.operation || 'unknown';
+      g.operations[op] = (g.operations[op] || 0) + 1;
+    } else {
+      unattr.apiEvents.push(ev);
+      splitEntities(ev.queriedEntities).forEach(e => unattr.entities.add(e));
+    }
+  }
+
+  const groupList = Object.keys(TRACKED_ECAS)
+    .filter(id => groups.has(id))
+    .map(id => {
+      const g = groups.get(id);
+      const sessions = [...g.sessions.values()];
+      return {
+        ecaId: g.ecaId, label: g.label, appName: g.appName,
+        sessions, sessionCount: sessions.length,
+        apiEvents: g.apiEvents, apiCount: g.apiEvents.length,
+        distinctEntities: [...g.entities], operations: g.operations,
+      };
+    });
+
+  const attributed = groupList.reduce((s, g) => s + g.apiCount, 0);
+  const sessions   = groupList.reduce((s, g) => s + g.sessionCount, 0);
+
+  return {
+    window,
+    activeConnection,
+    trackedEcas: trackedEcaSummary(),
+    groups: groupList,
+    unattributed: {
+      apiEvents: unattr.apiEvents,
+      apiCount: unattr.apiEvents.length,
+      distinctEntities: [...unattr.entities],
+    },
+    totals: {
+      loginEvents: rawLoginCount,
+      apiEvents: apiEvents.length,
+      attributed,
+      unattributed: unattr.apiEvents.length,
+      sessions,
+    },
+    storesEmpty: (rawLoginCount + apiEvents.length) === 0,
+  };
+}
+
+/** One-shot correlation over fixed windows. */
+async function correlateEcaTraffic({ apiSinceIso, loginSinceIso, apiLimit = 200, loginLimit = 120, window }) {
+  const logins = await fetchEvents({ types: ['LoginEvent', 'LoginAsEvent'], sinceIso: loginSinceIso, perTypeLimit: loginLimit });
+  const index = newEcaIndex();
+  indexEcaLogins(index, logins);
+  const apiEvents = await fetchEvents({ types: ['ApiEvent'], sinceIso: apiSinceIso, perTypeLimit: apiLimit });
+  return buildTraceResult({ index, apiEvents, rawLoginCount: logins.length, window });
+}
+
+/** Resolve the api window + (wider) login-lookback window from request params. */
+function ecaTraceWindow(query) {
+  const hours = Math.min(Math.max(parseInt(query.hours || '6', 10) || 6, 1), 720);
+  const reqLookback = parseInt(query.loginLookbackHours || String(ECA_LOGIN_LOOKBACK_HOURS), 10) || ECA_LOGIN_LOOKBACK_HOURS;
+  const loginLookbackHours = Math.max(reqLookback, hours);   // logins must span >= the api window
+  const now = Date.now();
+  return {
+    hours, loginLookbackHours,
+    apiSinceIso:   new Date(now - hours * 3600 * 1000).toISOString(),
+    loginSinceIso: new Date(now - loginLookbackHours * 3600 * 1000).toISOString(),
+  };
+}
+
+// One-shot pull (backfill / manual refresh).
+app.get('/api/eca-trace', requireAuth, async (req, res) => {
+  const w = ecaTraceWindow(req.query);
+  try {
+    const result = await correlateEcaTraffic({
+      apiSinceIso: w.apiSinceIso, loginSinceIso: w.loginSinceIso,
+      window: { apiSinceIso: w.apiSinceIso, loginSinceIso: w.loginSinceIso, hours: w.hours, loginLookbackHours: w.loginLookbackHours },
+    });
+    res.json(result);
+  } catch (err) {
+    console.error('[/api/eca-trace] error:', err.message);
+    if (err.code === 'NOT_AUTHENTICATED') return res.status(401).json({ error: 'NOT_AUTHENTICATED', loginUrl: '/oauth/login' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live SSE stream. Maintains a session index that GROWS across polls and
+// re-attributes ApiEvents each poll, so late-arriving logins pull previously
+// unattributed rows into their group. Emits a full TraceResult snapshot on change.
+app.get('/api/eca-trace/stream', requireAuth, async (req, res) => {
+  const w = ecaTraceWindow(req.query);
+
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  // Connection-scoped state — none of it resets between polls.
+  const index = newEcaIndex();
+  const seenApi = new Set();
+  const allApi = [];             // every ApiEvent seen, re-attributed each build
+  let rawLoginCount = 0;
+  let loginWatermark = w.loginSinceIso;
+  let apiWatermark   = w.apiSinceIso;
+  let lastSnapshot = '';
+  let closed = false;
+  let timer = null;
+
+  const window = { apiSinceIso: w.apiSinceIso, loginSinceIso: w.loginSinceIso, hours: w.hours, loginLookbackHours: w.loginLookbackHours };
+  send('status', { message: 'connected', activeConnection, pollMs: EVENTS_POLL_MS });
+
+  async function poll() {
+    if (closed) return;
+    try {
+      // 1) New logins → enlarge the index (this also re-attributes on rebuild).
+      const logins = await fetchEvents({ types: ['LoginEvent', 'LoginAsEvent'], sinceIso: loginWatermark, perTypeLimit: 120 });
+      const freshLogins = logins.filter(l => l.eventDate && l.eventDate > loginWatermark);
+      rawLoginCount += freshLogins.length;
+      indexEcaLogins(index, freshLogins);
+      for (const l of freshLogins) { if (l.eventDate > loginWatermark) loginWatermark = l.eventDate; }
+
+      // 2) New ApiEvents (skip already-seen), accumulate for re-attribution.
+      const api = await fetchEvents({ types: ['ApiEvent'], sinceIso: apiWatermark, perTypeLimit: 200 });
+      const freshApi = api.filter(e => !seenApi.has(e.id));
+      for (const e of freshApi) {
+        seenApi.add(e.id);
+        allApi.push(e);
+        if (e.eventDate && e.eventDate > apiWatermark) apiWatermark = e.eventDate;
+      }
+      if (seenApi.size > 5000) { seenApi.clear(); allApi.forEach(e => seenApi.add(e.id)); }
+
+      // 3) Rebuild the full snapshot; emit only if it changed.
+      const result = buildTraceResult({ index, apiEvents: allApi, rawLoginCount, window });
+      const snapshot = JSON.stringify(result);
+      if (snapshot !== lastSnapshot) {
+        lastSnapshot = snapshot;
+        send('trace', result);
+      } else {
+        send('heartbeat', { at: apiWatermark, activeConnection });
+      }
+    } catch (err) {
+      send('error', { message: err.message, code: err.code || null });
+    }
+  }
+
+  await poll();
+  timer = setInterval(poll, EVENTS_POLL_MS);
+
+  req.on('close', () => { closed = true; if (timer) clearInterval(timer); try { res.end(); } catch { /**/ } });
+});
+
 // ── Serve built frontend ─────────────────────────────────────────────────────
 
 const DIST = path.join(__dirname, 'dist');
@@ -1287,6 +2083,11 @@ app.get('*', (req, res) => {
 app.listen(PORT, () => {
   console.log(`\n  Agentforce Today Remodel  →  http://localhost:${PORT}`);
   console.log(`  Data connections          →  ${Object.values(CONNECTIONS).map(c => `${c.id}${c.available ? '' : ' (unconfigured)'}${c.id === activeConnection ? ' [active]' : ''}`).join(', ')}`);
-  const llmDesc = GW_URL ? `Gateway → ${GW_URL}` : anthropic ? 'Anthropic Claude (direct)' : 'fallback (no LLM configured)';
-  console.log(`  AI / Chat                 →  ${llmDesc}\n`);
+  const externalDesc = GW_URL ? `Gateway → ${GW_URL}`
+    : bedrockGwEnabled() ? `Bedrock gateway → ${BEDROCK_GW_URL} (${BEDROCK_GW_MODEL}) · token synced from settings.json`
+    : anthropic ? 'Anthropic Claude (direct)' : 'not configured';
+  const llmDesc = llmProvider === 'models-api'
+    ? `Salesforce Models API (${SF_MODELS_API_MODEL})${isModelsAuthenticated() ? '' : ' — awaiting ECA auth'} · external: ${externalDesc}`
+    : externalLlmEnabled() ? externalDesc : 'fallback (no LLM configured)';
+  console.log(`  AI / Chat                 →  provider=${llmProvider} · ${llmDesc}\n`);
 });

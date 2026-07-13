@@ -1381,3 +1381,352 @@ a { color: inherit; text-decoration: none; }
   .briefings-grid { grid-template-columns: 1fr; }
   .dashboard-panel { padding: 20px 16px 32px; }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Event Monitor
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Header view tabs (replaces the static nav) */
+.header-tabs { display: flex; gap: 4px; }
+.header-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12.5px; font-weight: 600; letter-spacing: .01em;
+  color: var(--text-3);
+  padding: 6px 12px; border-radius: 999px;
+  transition: color .15s, background .15s;
+}
+.header-tab:hover { color: var(--text-1); background: rgba(139,115,85,.07); }
+.header-tab--active { color: var(--accent); background: rgba(199,91,46,.09); }
+.header-tab-live-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 0 rgba(199,91,46,.5);
+  animation: evpulse 2s infinite;
+}
+@keyframes evpulse {
+  0%   { box-shadow: 0 0 0 0 rgba(199,91,46,.45); }
+  70%  { box-shadow: 0 0 0 6px rgba(199,91,46,0); }
+  100% { box-shadow: 0 0 0 0 rgba(199,91,46,0); }
+}
+
+/* Connection accent colours — one per connection type */
+:root {
+  --conn-sf-mcp:    #7c5cbf;
+  --conn-sf-models: #2f8f83;
+  --conn-dx-mcp:    #c94f7c;
+  --conn-cli:       #c77f2e;
+  --conn-browser:   #3a6ea5;
+  --conn-other:     #9a938a;
+  --etype-LoginEvent:        #3a6ea5;
+  --etype-LoginAsEvent:      #b0538f;
+  --etype-ApiEvent:          #7c5cbf;
+  --etype-LogoutEvent:       #8a8078;
+  --etype-ReportEvent:       #2f8f83;
+  --etype-LightningUriEvent: #c77f2e;
+}
+
+/* Layout: feed + side rail */
+.evmon {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  flex: 1; overflow: hidden;
+}
+.evmon-main {
+  display: flex; flex-direction: column;
+  overflow: hidden; padding: 22px 24px 0;
+}
+
+.evmon-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.evmon-title-row { display: flex; align-items: center; gap: 12px; }
+.evmon-title {
+  font-family: var(--font-brand); font-style: italic; font-weight: 500;
+  font-size: 26px; color: var(--text-1); letter-spacing: -.01em;
+}
+.evmon-subtitle { font-size: 13px; color: var(--text-2); margin-top: 4px; max-width: 640px; line-height: 1.5; }
+.evmon-subtitle strong { color: var(--text-1); font-weight: 600; }
+
+.evmon-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: .06em;
+  padding: 4px 9px; border-radius: 999px;
+  background: rgba(107,124,94,.12); color: var(--accent-green);
+}
+.evmon-status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.evmon-status--live .evmon-status-dot { animation: evpulse 2s infinite; }
+.evmon-status--paused, .evmon-status--idle { background: rgba(139,115,85,.12); color: var(--text-3); }
+.evmon-status--reconnecting, .evmon-status--connecting { background: rgba(199,91,46,.12); color: var(--accent); }
+
+.evmon-head-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.evmon-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12.5px; font-weight: 600;
+  padding: 7px 13px; border-radius: var(--radius-sm);
+  background: var(--bg-white); border: 1px solid var(--border-md); color: var(--text-2);
+  transition: all .15s;
+}
+.evmon-btn:hover { border-color: var(--accent); color: var(--accent); }
+.evmon-btn--live { color: var(--accent); border-color: rgba(199,91,46,.4); background: rgba(199,91,46,.06); }
+.evmon-btn--ghost { background: transparent; }
+
+/* Type filter chips */
+.evmon-filters { display: flex; flex-wrap: wrap; gap: 7px; margin: 16px 0 12px; }
+.evmon-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600;
+  padding: 5px 11px; border-radius: 999px;
+  background: var(--bg-white); border: 1px solid var(--border); color: var(--text-3);
+  opacity: .6; transition: all .15s;
+}
+.evmon-chip-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.evmon-chip--on { opacity: 1; color: var(--text-1); border-color: var(--border-md); }
+.evmon-chip--type-LoginEvent.evmon-chip--on        { color: var(--etype-LoginEvent); }
+.evmon-chip--type-LoginAsEvent.evmon-chip--on      { color: var(--etype-LoginAsEvent); }
+.evmon-chip--type-ApiEvent.evmon-chip--on          { color: var(--etype-ApiEvent); }
+.evmon-chip--type-LogoutEvent.evmon-chip--on       { color: var(--etype-LogoutEvent); }
+.evmon-chip--type-ReportEvent.evmon-chip--on       { color: var(--etype-ReportEvent); }
+.evmon-chip--type-LightningUriEvent.evmon-chip--on { color: var(--etype-LightningUriEvent); }
+
+.evmon-error {
+  background: #fef2f2; border: 1px solid #fecaca; color: #dc2626;
+  border-radius: var(--radius-sm); padding: 8px 12px; font-size: 12.5px; margin-bottom: 10px;
+}
+
+/* Feed */
+.evmon-feed {
+  flex: 1; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 6px;
+  padding-bottom: 24px;
+}
+.evmon-empty {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  color: var(--text-3); font-size: 13.5px; line-height: 1.6;
+  text-align: center; padding: 60px 40px; flex-direction: column;
+}
+.evmon-empty strong { color: var(--text-2); }
+
+/* Event row */
+.evrow {
+  position: relative;
+  display: grid;
+  grid-template-columns: 76px 1fr auto;
+  gap: 12px; align-items: center;
+  background: var(--bg-white);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 14px 9px 16px;
+  animation: evrow-in .32s ease;
+}
+@keyframes evrow-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: none; }
+}
+.evrow-accent {
+  position: absolute; left: 0; top: 8px; bottom: 8px; width: 3px;
+  border-radius: 3px; background: var(--conn-other);
+}
+.evrow--conn-sf-mcp    .evrow-accent { background: var(--conn-sf-mcp); }
+.evrow--conn-sf-models .evrow-accent { background: var(--conn-sf-models); }
+.evrow--conn-dx-mcp    .evrow-accent { background: var(--conn-dx-mcp); }
+.evrow--conn-cli       .evrow-accent { background: var(--conn-cli); }
+.evrow--conn-browser   .evrow-accent { background: var(--conn-browser); }
+
+.evrow-time { display: flex; flex-direction: column; line-height: 1.25; }
+.evrow-clock { font-size: 12px; font-weight: 600; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.evrow-ago   { font-size: 10.5px; color: var(--text-3); }
+
+.evrow-body { min-width: 0; }
+.evrow-line1 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.evrow-type {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 5px;
+  background: rgba(139,115,85,.1); color: var(--text-2);
+}
+.evrow-type--LoginEvent        { background: rgba(58,110,165,.12);  color: var(--etype-LoginEvent); }
+.evrow-type--LoginAsEvent      { background: rgba(176,83,143,.12);  color: var(--etype-LoginAsEvent); }
+.evrow-type--ApiEvent          { background: rgba(124,92,191,.12);  color: var(--etype-ApiEvent); }
+.evrow-type--LogoutEvent       { background: rgba(138,128,120,.14); color: var(--etype-LogoutEvent); }
+.evrow-type--ReportEvent       { background: rgba(47,143,131,.12);  color: var(--etype-ReportEvent); }
+.evrow-type--LightningUriEvent { background: rgba(199,127,46,.12);  color: var(--etype-LightningUriEvent); }
+
+.evrow-conn {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; font-weight: 600; color: var(--text-2);
+}
+.evrow-conn-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--conn-other); }
+.evrow-conn--sf-mcp    .evrow-conn-dot { background: var(--conn-sf-mcp); }
+.evrow-conn--sf-models .evrow-conn-dot { background: var(--conn-sf-models); }
+.evrow-conn--dx-mcp    .evrow-conn-dot { background: var(--conn-dx-mcp); }
+.evrow-conn--cli       .evrow-conn-dot { background: var(--conn-cli); }
+.evrow-conn--browser   .evrow-conn-dot { background: var(--conn-browser); }
+
+/* Provenance chip: which session id attributed this ApiEvent to its ECA */
+.evrow-prov {
+  font-size: 10px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 4px;
+  background: rgba(124,92,191,.13); color: var(--conn-sf-mcp);
+}
+.evrow-prov--session { background: rgba(47,143,131,.14);  color: var(--conn-sf-models); }
+.evrow-prov--history { background: rgba(124,92,191,.13);  color: var(--conn-sf-mcp); }
+.evrow-prov--login   { background: rgba(201,79,124,.14);  color: var(--conn-dx-mcp); }
+
+.evrow-trace {
+  font-size: 10px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 4px;
+}
+.evrow-trace--ok  { background: rgba(107,124,94,.14); color: var(--accent-green); }
+.evrow-trace--gap { background: rgba(199,91,46,.13);  color: var(--accent); }
+
+.evrow-line2 { font-size: 12.5px; color: var(--text-2); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.evrow-line2 strong { color: var(--text-1); font-weight: 600; }
+.evrow-line2 em { font-style: normal; color: var(--accent-dark); font-weight: 500; }
+
+.evrow-user {
+  font-size: 11.5px; color: var(--text-3); font-weight: 500;
+  max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Side rail: connection legend */
+.evleg {
+  border-left: 1px solid var(--border);
+  background: var(--bg-white);
+  overflow-y: auto;
+  display: flex; flex-direction: column;
+  padding: 22px 18px;
+}
+.evleg-label { font-size: 10.5px; font-weight: 700; letter-spacing: .08em; color: var(--text-3); text-transform: uppercase; }
+.evleg-hint { font-size: 12px; color: var(--text-3); line-height: 1.55; margin: 8px 0 14px; }
+.evleg-hint code { font-size: 11px; background: rgba(139,115,85,.1); padding: 1px 4px; border-radius: 4px; color: var(--text-2); }
+
+.evleg-item {
+  width: 100%;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 10px; border-radius: var(--radius-sm);
+  border: 1px solid transparent; text-align: left;
+  transition: background .14s, border-color .14s;
+}
+.evleg-item:hover { background: rgba(139,115,85,.05); }
+.evleg-item--active { background: rgba(139,115,85,.07); border-color: var(--border-md); }
+.evleg-item-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.evleg-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; background: var(--conn-other); }
+.evleg-dot--all { background: linear-gradient(135deg, var(--conn-sf-mcp), var(--conn-cli)); }
+.evleg-dot--sf-mcp    { background: var(--conn-sf-mcp); }
+.evleg-dot--sf-models { background: var(--conn-sf-models); }
+.evleg-dot--dx-mcp    { background: var(--conn-dx-mcp); }
+.evleg-dot--cli       { background: var(--conn-cli); }
+.evleg-dot--browser   { background: var(--conn-browser); }
+.evleg-item-text { display: flex; flex-direction: column; min-width: 0; }
+.evleg-item-name { font-size: 12.5px; font-weight: 600; color: var(--text-1); }
+.evleg-item-sub  { font-size: 10.5px; color: var(--text-3); }
+.evleg-item-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.evleg-count {
+  font-size: 11px; font-weight: 700; color: var(--text-2);
+  background: rgba(139,115,85,.1); padding: 2px 7px; border-radius: 999px;
+  font-variant-numeric: tabular-nums; min-width: 22px; text-align: center;
+}
+.evleg-flag {
+  font-size: 9.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--accent); background: rgba(199,91,46,.12); padding: 1px 5px; border-radius: 4px;
+}
+
+/* Observability callout */
+.evleg-callout {
+  margin-top: 18px; padding: 14px;
+  background: linear-gradient(160deg, rgba(199,91,46,.06), rgba(199,91,46,.02));
+  border: 1px solid rgba(199,91,46,.2); border-radius: var(--radius-md);
+}
+.evleg-callout-head {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; font-weight: 700; letter-spacing: .02em; color: var(--accent-dark);
+  margin-bottom: 8px;
+}
+.evleg-callout-body { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+.evleg-callout-body strong { color: var(--text-1); }
+.evleg-callout-body em { font-style: normal; font-weight: 600; color: var(--accent-dark); }
+.evleg-callout-body code { font-size: 10.5px; background: rgba(199,91,46,.1); padding: 1px 4px; border-radius: 4px; color: var(--accent-dark); }
+.evleg-ids { margin-top: 12px; display: flex; flex-direction: column; gap: 5px; }
+.evleg-ids > div { display: flex; justify-content: space-between; align-items: center; font-size: 11px; }
+.evleg-ids span { color: var(--text-3); font-weight: 600; }
+.evleg-ids code { font-size: 10.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+/* ── ECA Trace ─────────────────────────────────────────────────────────────── */
+.eca {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  flex: 1; overflow: hidden;
+}
+.eca-groups {
+  flex: 1; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 16px;
+  padding: 16px 0 24px;
+}
+
+.eca-group {
+  background: var(--bg-white);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--conn-other);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  animation: evrow-in .32s ease;
+}
+.eca-group--sf-mcp { border-left-color: var(--conn-sf-mcp); }
+.eca-group--dx-mcp { border-left-color: var(--conn-dx-mcp); }
+.eca-group--unattributed { border-left-color: var(--conn-other); border-style: dashed; }
+
+.eca-group-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.eca-group-title { display: flex; align-items: center; gap: 8px; }
+.eca-group-name { font-size: 15px; font-weight: 700; color: var(--text-1); }
+.eca-group-app {
+  font-size: 10.5px; color: var(--text-3);
+  background: rgba(139,115,85,.1); padding: 2px 7px; border-radius: 5px;
+}
+.eca-group-stats { display: flex; gap: 14px; font-size: 12px; color: var(--text-3); }
+.eca-group-stats strong { color: var(--text-1); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.eca-entities { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.eca-chip {
+  font-size: 11px; font-weight: 600; color: var(--text-2);
+  background: rgba(139,115,85,.08); border: 1px solid var(--border);
+  padding: 2px 8px; border-radius: 999px;
+}
+.eca-chip--op   { color: var(--accent-dark); background: rgba(199,91,46,.07); }
+.eca-chip--more { color: var(--text-3); }
+
+.eca-sessions { display: flex; flex-direction: column; gap: 5px; margin-top: 12px; }
+.eca-session {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-radius: var(--radius-sm);
+  background: rgba(139,115,85,.04); border: 1px solid var(--border);
+  font-size: 11.5px;
+}
+.eca-session-key { font-size: 11px; color: var(--text-2); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.eca-session-user { font-weight: 600; color: var(--text-1); }
+.eca-session-meta { display: flex; gap: 5px; color: var(--text-3); margin-left: auto; }
+
+.eca-group-feed { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.eca-group-empty { font-size: 12px; color: var(--text-3); font-style: italic; padding: 4px 2px; }
+
+.eca-gap-note { font-size: 12px; color: var(--text-2); line-height: 1.55; margin-top: 8px; }
+.eca-gap-note code { font-size: 10.5px; background: rgba(199,91,46,.1); padding: 1px 4px; border-radius: 4px; color: var(--accent-dark); }
+
+/* Legend totals grid */
+.eca-totals { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.eca-stat {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 10px 12px; border-radius: var(--radius-sm);
+  background: rgba(139,115,85,.05); border: 1px solid var(--border);
+}
+.eca-stat-value { font-size: 20px; font-weight: 700; color: var(--text-1); font-variant-numeric: tabular-nums; }
+.eca-stat-label { font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text-3); }
+.eca-stat--ok  .eca-stat-value { color: var(--accent-green); }
+.eca-stat--gap .eca-stat-value { color: var(--accent); }
+
+.eca-eca-app { margin-top: 3px; }
+.evleg-callout--warn {
+  background: linear-gradient(160deg, rgba(201,79,124,.07), rgba(201,79,124,.02));
+  border-color: rgba(201,79,124,.28);
+}
+.evleg-callout--warn .evleg-callout-head { color: var(--conn-dx-mcp); }
+
+@media (max-width: 900px) {
+  .evmon, .eca { grid-template-columns: 1fr; }
+  .evleg { border-left: none; border-top: 1px solid var(--border); }
+}

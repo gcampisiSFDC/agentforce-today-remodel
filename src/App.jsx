@@ -4,6 +4,8 @@ import DashboardPanel from './components/DashboardPanel.jsx';
 import ActionPanel from './components/ActionPanel.jsx';
 import AuthGate from './components/AuthGate.jsx';
 import ForecastChat from './components/ForecastChat.jsx';
+import EventMonitor from './components/EventMonitor.jsx';
+import EcaTrace from './components/eca/EcaTrace.jsx';
 
 const MODELS = [
   { id: 'claude-opus-4-7',             label: 'Claude Opus 4.7',      provider: 'Anthropic', available: true },
@@ -32,6 +34,7 @@ export default function App() {
   const [connections, setConnections] = useState([]);
   const [activeConnection, setActiveConnection] = useState(null);
   const [connOpen, setConnOpen]       = useState(false);
+  const [view, setView]               = useState('dashboard'); // 'dashboard' | 'events' | 'eca-trace'
 
   // Check auth status on mount and after OAuth redirect
   useEffect(() => {
@@ -180,26 +183,34 @@ export default function App() {
         connOpen={connOpen}
         onConnToggle={(e) => { e.stopPropagation(); setConnOpen(o => !o); }}
         onConnChange={handleConnectionChange}
+        view={view}
+        onViewChange={setView}
       />
-      <div className="layout">
-        <DashboardPanel
-          date={data?.date}
-          score={data?.score}
-          kpis={data?.kpis ?? {}}
-          charts={data?.charts ?? {}}
-          briefings={data?.briefings ?? []}
-          loading={loading}
-          activeBriefing={activeBriefing}
-          onBriefingClick={setActiveBriefing}
-        />
-        <ActionPanel
-          actions={data?.actions ?? []}
-          relatedRecords={data?.relatedRecords ?? []}
-          loading={loading}
-          activeBriefing={activeBriefing}
-          onOpenChat={() => setChatOpen(true)}
-        />
-      </div>
+      {view === 'events' ? (
+        <EventMonitor activeConnection={activeConnection} />
+      ) : view === 'eca-trace' ? (
+        <EcaTrace activeConnection={activeConnection} />
+      ) : (
+        <div className="layout">
+          <DashboardPanel
+            date={data?.date}
+            score={data?.score}
+            kpis={data?.kpis ?? {}}
+            charts={data?.charts ?? {}}
+            briefings={data?.briefings ?? []}
+            loading={loading}
+            activeBriefing={activeBriefing}
+            onBriefingClick={setActiveBriefing}
+          />
+          <ActionPanel
+            actions={data?.actions ?? []}
+            relatedRecords={data?.relatedRecords ?? []}
+            loading={loading}
+            activeBriefing={activeBriefing}
+            onOpenChat={() => setChatOpen(true)}
+          />
+        </div>
+      )}
     </div>
   );
 }
