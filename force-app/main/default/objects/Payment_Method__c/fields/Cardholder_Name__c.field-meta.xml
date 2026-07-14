@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Cardholder_Name__c</fullName>
+    <label>Cardholder Name</label>
+    <type>Text</type>
+    <length>121</length>
+    <securityClassification>Confidential</securityClassification>
+    <complianceGroup>PII</complianceGroup>
+    <description>Name printed on the card. Classified Confidential / PII.</description>
+</CustomField>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<TransactionSecurityPolicy xmlns="http://soap.sforce.com/2006/04/metadata">
+    <action>
+        <block>true</block>
+        <endSession>false</endSession>
+        <freezeUser>false</freezeUser>
+        <notifications>
+            <inApp>true</inApp>
+            <sendEmail>false</sendEmail>
+            <user>gcampisi+dxdo@salesforce.com</user>
+        </notifications>
+        <twoFactorAuthentication>false</twoFactorAuthentication>
+    </action>
+    <active>true</active>
+    <apexClass>TrxSec_DetectHighRiskAPIQueries</apexClass>
+    <blockMessage>Blocked: this query requests high-risk (highly sensitive) data. Contact your administrator if you need access.</blockMessage>
+    <description>Blocks API/SOQL queries that reference fields classified as a High Risk data sensitivity level.</description>
+    <developerName>High_Risk_Data_in_API_Queries</developerName>
+    <eventName>ApiEvent</eventName>
+    <masterLabel>High Risk Data in API Queries</masterLabel>
+    <type>CustomApexPolicy</type>
+</TransactionSecurityPolicy>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<TransactionSecurityPolicy xmlns="http://soap.sforce.com/2006/04/metadata">
+    <action>
+        <block>true</block>
+        <endSession>false</endSession>
+        <freezeUser>false</freezeUser>
+        <notifications>
+            <inApp>true</inApp>
+            <sendEmail>false</sendEmail>
+            <user>gcampisi+dxdo@salesforce.com</user>
+        </notifications>
+        <twoFactorAuthentication>false</twoFactorAuthentication>
+    </action>
+    <active>true</active>
+    <apexClass>TrxSec_ThrottleContactPhoneQueries</apexClass>
+    <blockMessage>Blocked: this query requests more than 10 Contact records with the Phone field. Reduce the query scope or contact your administrator if you need access to more records.</blockMessage>
+    <description>Blocks API/SOQL queries that return more than 10 Contact records when the Phone field is queried.</description>
+    <developerName>Throttle_Contact_Phone_Queries</developerName>
+    <eventName>ApiEvent</eventName>
+    <masterLabel>Throttle Contact Phone Queries</masterLabel>
+    <type>CustomApexPolicy</type>
+</TransactionSecurityPolicy>

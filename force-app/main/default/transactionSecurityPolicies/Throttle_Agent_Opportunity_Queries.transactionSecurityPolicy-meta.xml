@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<TransactionSecurityPolicy xmlns="http://soap.sforce.com/2006/04/metadata">
+    <action>
+        <block>true</block>
+        <endSession>false</endSession>
+        <freezeUser>false</freezeUser>
+        <notifications>
+            <inApp>true</inApp>
+            <sendEmail>false</sendEmail>
+            <user>gcampisi+dxdo@salesforce.com</user>
+        </notifications>
+        <twoFactorAuthentication>false</twoFactorAuthentication>
+    </action>
+    <active>true</active>
+    <apexClass>TrxSec_ThrottleAgentOppQueries</apexClass>
+    <blockMessage>Blocked: personal agent/MCP access is limited to 200 Opportunity records per query. Use an approved integration (e.g. the Salesforce CLI) for larger extracts, or contact your administrator if you need agent access to more records.</blockMessage>
+    <description>Blocks API queries that return more than 200 Opportunity records when the request originates from a personal agent / External Client App (e.g. an MCP server) rather than a trusted integration such as the Salesforce CLI.</description>
+    <developerName>Throttle_Agent_Opportunity_Queries</developerName>
+    <eventName>ApiEvent</eventName>
+    <masterLabel>Throttle Agent Opportunity Queries</masterLabel>
+    <type>CustomApexPolicy</type>
+</TransactionSecurityPolicy>
