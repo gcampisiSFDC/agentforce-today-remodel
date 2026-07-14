@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Credit_Card_Number__c</fullName>
+    <label>Credit Card Number</label>
+    <type>EncryptedText</type>
+    <length>19</length>
+    <maskChar>asterisk</maskChar>
+    <maskType>lastFour</maskType>
+    <securityClassification>Restricted</securityClassification>
+    <complianceGroup>PCI;PII</complianceGroup>
+    <businessStatus>Active</businessStatus>
+    <description>Primary Account Number (PAN) stored directly on the Account. Encrypted and masked except for the last four characters. Classified Restricted (high risk), PCI, and PII; protected by the High Risk Data in API Queries transaction security policy.</description>
+</CustomField>
